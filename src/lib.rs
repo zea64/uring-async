@@ -1,4 +1,6 @@
-#![feature(pointer_byte_offsets)]
+#![feature(future_join)]
+
+pub mod ops;
 
 use core::{
 	ffi::c_void,
