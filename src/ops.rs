@@ -1,6 +1,6 @@
 use core::{
 	cell::RefCell,
-	future::{join, Future},
+	future::Future,
 	mem::MaybeUninit,
 	pin::Pin,
 	task::{Context, Poll},
@@ -42,7 +42,7 @@ impl<'a> Future for Nop<'a> {
 		this.submitted = true;
 		this.ring.borrow_mut().push(sqe).unwrap();
 
-		cx.waker().clone().wake();
+		cx.waker().wake_by_ref();
 
 		Poll::Pending
 	}
@@ -50,11 +50,11 @@ impl<'a> Future for Nop<'a> {
 
 #[cfg(test)]
 mod test {
-	use core::cell::RefCell;
+	use core::{cell::RefCell, future::join};
 
 	use futures::executor::block_on;
 
-	use crate::{ops::*, *};
+	use crate::ops::*;
 
 	#[test]
 	fn nop() {
@@ -79,9 +79,9 @@ mod test {
 	fn async_fn() {
 		async fn foo(ring: &RefCell<Uring>) {
 			println!("1");
-			let _ = Nop::new(&ring).await;
+			let _ = Nop::new(ring).await;
 			println!("2");
-			let _ = Nop::new(&ring).await;
+			let _ = Nop::new(ring).await;
 			println!("3");
 		}
 
@@ -94,9 +94,9 @@ mod test {
 	fn two_async_fns() {
 		async fn foo(ring: &RefCell<Uring>) {
 			println!("1");
-			let _ = Nop::new(&ring).await;
+			let _ = Nop::new(ring).await;
 			println!("2");
-			let _ = Nop::new(&ring).await;
+			let _ = Nop::new(ring).await;
 			println!("3");
 		}
 

@@ -4,11 +4,9 @@ pub mod ops;
 
 use core::{
 	ffi::c_void,
-	marker::PhantomData,
 	mem::size_of,
 	ptr::{self, NonNull},
 };
-use std::task::Waker;
 
 use rustix::{
 	fd::OwnedFd,
@@ -24,7 +22,7 @@ struct Queue<T: 'static> {
 	array: &'static mut [T],
 }
 
-impl<'a, T> core::fmt::Debug for Queue<T> {
+impl<T> core::fmt::Debug for Queue<T> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("Queue")
 			.field("our_ptr", self.our_ptr)
@@ -36,22 +34,13 @@ impl<'a, T> core::fmt::Debug for Queue<T> {
 	}
 }
 
-impl<'a, T: Default> Queue<T> {
+impl<T: Default> Queue<T> {
 	fn mask(&self) -> u32 {
 		self.len() - 1
 	}
 
 	fn len(&self) -> u32 {
 		self.array.len() as u32
-	}
-
-	fn get_nth(&mut self, seek: i32) -> &mut T {
-		let effective_our = (*self.our_ptr as i32).wrapping_add(seek) as u32;
-
-		unsafe {
-			self.array
-				.get_unchecked_mut((effective_our & self.mask()) as usize)
-		}
 	}
 
 	fn get_empty_nth(&mut self, seek: i32) -> Option<&mut T> {
