@@ -15,14 +15,14 @@ use rustix::{
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
 
-struct Queue<'a, T: 'a> {
-	our_ptr: &'a mut u32,
-	their_ptr: &'a mut u32,
-	flags: &'a mut u32,
-	array: &'a mut [T],
+struct Queue<T: 'static> {
+	our_ptr: &'static mut u32,
+	their_ptr: &'static mut u32,
+	flags: &'static mut u32,
+	array: &'static mut [T],
 }
 
-impl<'a, T> core::fmt::Debug for Queue<'a, T> {
+impl<'a, T> core::fmt::Debug for Queue<T> {
 	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 		f.debug_struct("Queue")
 			.field("our_ptr", self.our_ptr)
@@ -34,7 +34,7 @@ impl<'a, T> core::fmt::Debug for Queue<'a, T> {
 	}
 }
 
-impl<'a, T: Default> Queue<'a, T> {
+impl<'a, T: Default> Queue<T> {
 	fn mask(&self) -> u32 {
 		self.len() - 1
 	}
@@ -89,17 +89,17 @@ impl<'a, T: Default> Queue<'a, T> {
 	}
 }
 
-pub struct Uring<'a> {
+pub struct Uring {
 	fd: OwnedFd,
-	sq: Queue<'a, io_uring_sqe>,
-	cq: Queue<'a, io_uring_cqe>,
-	queue_base: NonNull<u32>,
+	sq: Queue<io_uring_sqe>,
+	cq: Queue<io_uring_cqe>,
 	queue_map_len: u32,
+	queue_base: NonNull<u32>,
 	sq_entries: NonNull<io_uring_sqe>,
 	callbacks: Box<[Option<Callback>]>,
 }
 
-impl<'a> Uring<'a> {
+impl Uring {
 	const NR_SQ_ENTRIES: u32 = 4096;
 
 	pub fn new() -> PosixResult<Self> {
@@ -131,7 +131,8 @@ impl<'a> Uring<'a> {
 		}
 
 		unsafe {
-			let queue_map_len = params.sq_off.array as usize + params.sq_entries as usize * size_of::<u32>();
+			let queue_map_len =
+				params.sq_off.array as usize + params.sq_entries as usize * size_of::<u32>();
 			let queues_ptr = mmap(
 				ptr::null_mut(),
 				queue_map_len,
@@ -196,7 +197,7 @@ impl<'a> Uring<'a> {
 		}
 	}
 
-	pub fn push(&mut self, mut sqe: Sqe<'a>) -> PosixResult<()> {
+	pub fn push(&mut self, mut sqe: Sqe) -> PosixResult<()> {
 		// Find empty slot in callback array.
 		let (callback_number, callback_slot) = self
 			.callbacks
@@ -248,14 +249,18 @@ impl<'a> Uring<'a> {
 	}
 }
 
-impl<'a> Drop for Uring<'a> {
+impl Drop for Uring {
 	fn drop(&mut self) {
 		unsafe {
 			let nr_sq_entries = self.sq.len() as usize;
 
 			munmap(self.queue_base.as_ptr().cast(), self.queue_map_len as usize).unwrap();
 
-			munmap(self.sq_entries.as_ptr().cast(), nr_sq_entries*size_of::<io_uring_sqe>()).unwrap();
+			munmap(
+				self.sq_entries.as_ptr().cast(),
+				nr_sq_entries * size_of::<io_uring_sqe>(),
+			)
+			.unwrap();
 		}
 	}
 }
@@ -263,15 +268,15 @@ impl<'a> Drop for Uring<'a> {
 type Callback = Box<dyn FnMut(&Cqe)>;
 
 #[derive(Default)]
-pub struct Sqe<'a>(io_uring_sqe, Option<Callback>, PhantomData<&'a Waker>);
+pub struct Sqe(io_uring_sqe, Option<Callback>);
 
-impl<'a> Sqe<'a> {
-	pub unsafe fn new(sqe: io_uring_sqe, callback: Callback) -> Sqe<'a> {
-		Sqe(sqe, Some(callback), Default::default())
+impl Sqe {
+	pub unsafe fn new(sqe: io_uring_sqe, callback: Callback) -> Self {
+		Sqe(sqe, Some(callback))
 	}
 
-	pub unsafe fn new_without_callback(sqe: io_uring_sqe) -> Sqe<'a> {
-		Sqe(sqe, None, Default::default())
+	pub unsafe fn new_without_callback(sqe: io_uring_sqe) -> Self {
+		Sqe(sqe, None)
 	}
 }
 
@@ -282,9 +287,10 @@ pub struct Cqe(io_uring_cqe);
 #[cfg(test)]
 mod test {
 	use core::mem::MaybeUninit;
+
 	use crate::*;
 
-	fn new_nop() -> Sqe<'static> {
+	fn new_nop() -> Sqe {
 		let mut a: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
 		a.opcode = IoringOp::Nop;
 		unsafe { Sqe::new_without_callback(a) }
@@ -327,7 +333,8 @@ mod test {
 				nop,
 				Box::new(move |cqe: &Cqe| println!("{:?} {}", cqe, num)),
 			)
-		}).unwrap();
+		})
+		.unwrap();
 
 		ring.submit().unwrap();
 	}
@@ -342,7 +349,8 @@ mod test {
 
 			ring.push(unsafe {
 				Sqe::new(nop, Box::new(move |cqe: &Cqe| println!("{:?} {}", cqe, i)))
-			}).unwrap();
+			})
+			.unwrap();
 
 			ring.submit().unwrap();
 		}
