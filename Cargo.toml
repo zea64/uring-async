@@ -1,0 +1,7 @@
+[package]
+name = "uring-async"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rustix = { version = "0.38", features = ["io_uring", "mm"] }
