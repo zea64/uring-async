@@ -4,6 +4,7 @@ pub mod ops;
 
 use core::{
 	ffi::c_void,
+	fmt::{self, Debug},
 	mem::size_of,
 	ptr::{self, NonNull},
 };
@@ -15,15 +16,15 @@ use rustix::{
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
 
-struct Queue<T: 'static> {
+struct Queue<T: 'static + Debug> {
 	our_ptr: &'static mut u32,
 	their_ptr: &'static mut u32,
 	flags: &'static mut u32,
 	array: &'static mut [T],
 }
 
-impl<T> core::fmt::Debug for Queue<T> {
-	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<T: Debug> Debug for Queue<T> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Queue")
 			.field("our_ptr", self.our_ptr)
 			.field("their_ptr", self.their_ptr)
@@ -34,7 +35,7 @@ impl<T> core::fmt::Debug for Queue<T> {
 	}
 }
 
-impl<T: Default> Queue<T> {
+impl<T: Default + Debug> Queue<T> {
 	fn mask(&self) -> u32 {
 		self.len() - 1
 	}
@@ -80,14 +81,15 @@ impl<T: Default> Queue<T> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Uring {
 	fd: OwnedFd,
-	sq: Queue<io_uring_sqe>,
+	sq: Queue<Sqe>,
 	cq: Queue<io_uring_cqe>,
 	queue_map_len: u32,
 	queue_base: NonNull<u32>,
-	sq_entries: NonNull<io_uring_sqe>,
-	callbacks: Box<[Option<Callback>]>,
+	sq_entries: NonNull<Sqe>,
+	ready_cqes: Vec<Cqe>,
 }
 
 impl Uring {
@@ -151,7 +153,7 @@ impl Uring {
 				&mut *base.byte_offset(offset as isize).cast()
 			}
 
-			let sq: Queue<io_uring_sqe> = Queue {
+			let sq: Queue<Sqe> = Queue {
 				our_ptr: to_ptr(queues_ptr, params.sq_off.tail),
 				their_ptr: to_ptr(queues_ptr, params.sq_off.head),
 				flags: to_ptr(queues_ptr, params.sq_off.flags),
@@ -171,11 +173,6 @@ impl Uring {
 				),
 			};
 
-			let mut callbacks_vec = Vec::with_capacity(Uring::NR_SQ_ENTRIES as usize);
-			for _ in 0..Uring::NR_SQ_ENTRIES {
-				callbacks_vec.push(None);
-			}
-
 			Ok(Self {
 				fd,
 				sq,
@@ -183,27 +180,14 @@ impl Uring {
 				sq_entries: NonNull::new_unchecked(sq_entries_ptr.cast()),
 				queue_base: NonNull::new_unchecked(queues_ptr.cast()),
 				queue_map_len: queue_map_len as u32,
-				callbacks: callbacks_vec.into_boxed_slice(),
+				ready_cqes: Vec::new(),
 			})
 		}
 	}
 
 	pub fn push(&mut self, mut sqe: Sqe) -> PosixResult<()> {
-		// Find empty slot in callback array.
-		let (callback_number, callback_slot) = self
-			.callbacks
-			.iter_mut()
-			.enumerate()
-			.filter(|x| x.1.is_none())
-			.nth(0)
-			.unwrap();
-		// Record callback.
-		*callback_slot = sqe.1;
-		// Link sqe/cqe to this callback.
-		sqe.0.user_data.u64_ = callback_number as u64;
-
 		loop {
-			let x = self.sq.push(&mut sqe.0);
+			let x = self.sq.push(&mut sqe);
 
 			if x.is_ok() {
 				return Ok(());
@@ -227,16 +211,20 @@ impl Uring {
 		}?;
 
 		while let Some(cqe) = self.cq.pop() {
-			let callback = &mut self.callbacks[unsafe { cqe.user_data.u64_ } as usize];
-
-			let our_cqe = Cqe(cqe);
-
-			if let Some(mut f) = callback.take() {
-				f(&our_cqe);
-			}
+			self.ready_cqes.push(Cqe(cqe));
 		}
 
 		Ok(submitted)
+	}
+
+	pub fn get_cqe(&mut self, user_data: *mut ()) -> Option<Cqe> {
+		let index = self
+			.ready_cqes
+			.iter()
+			.enumerate()
+			.find(|cqe| cqe.1 .0.user_data.ptr() == user_data.cast())
+			.map(|(index, _cqe)| index)?;
+		Some(self.ready_cqes.swap_remove(index))
 	}
 }
 
@@ -256,18 +244,30 @@ impl Drop for Uring {
 	}
 }
 
-type Callback = Box<dyn FnMut(&Cqe)>;
-
 #[derive(Default)]
-pub struct Sqe(io_uring_sqe, Option<Callback>);
+#[repr(transparent)]
+pub struct Sqe(io_uring_sqe);
 
 impl Sqe {
-	pub unsafe fn new(sqe: io_uring_sqe, callback: Callback) -> Self {
-		Sqe(sqe, Some(callback))
+	pub unsafe fn new(mut sqe: io_uring_sqe, user_data: *mut ()) -> Self {
+		sqe.user_data.ptr = io_uring_ptr::from(user_data.cast());
+		Sqe(sqe)
 	}
+}
 
-	pub unsafe fn new_without_callback(sqe: io_uring_sqe) -> Self {
-		Sqe(sqe, None)
+impl Debug for Sqe {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Sqe")
+			.field("user_data", &self.0.user_data.ptr())
+			.finish()
+	}
+}
+
+impl core::ops::Deref for Sqe {
+	type Target = io_uring_sqe;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
 	}
 }
 
@@ -284,7 +284,7 @@ mod test {
 	fn new_nop() -> Sqe {
 		let mut a: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
 		a.opcode = IoringOp::Nop;
-		unsafe { Sqe::new_without_callback(a) }
+		unsafe { Sqe::new(a, ptr::null_mut()) }
 	}
 
 	#[test]
@@ -308,42 +308,5 @@ mod test {
 			ring.push(new_nop()).unwrap();
 		}
 		ring.submit().unwrap();
-	}
-
-	#[test]
-	fn one_callback() {
-		let mut ring = Uring::new().unwrap();
-
-		let num = 1;
-
-		let mut nop: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
-		nop.opcode = IoringOp::Nop;
-
-		ring.push(unsafe {
-			Sqe::new(
-				nop,
-				Box::new(move |cqe: &Cqe| println!("{:?} {}", cqe, num)),
-			)
-		})
-		.unwrap();
-
-		ring.submit().unwrap();
-	}
-
-	#[test]
-	fn many_callback() {
-		let mut ring = Uring::new().unwrap();
-
-		for i in 0..(4096 * 2 + 2) {
-			let mut nop: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
-			nop.opcode = IoringOp::Nop;
-
-			ring.push(unsafe {
-				Sqe::new(nop, Box::new(move |cqe: &Cqe| println!("{:?} {}", cqe, i)))
-			})
-			.unwrap();
-
-			ring.submit().unwrap();
-		}
 	}
 }

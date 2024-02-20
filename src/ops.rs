@@ -31,13 +31,18 @@ impl<'a> Future for Nop<'a> {
 		let this = Pin::into_inner(self);
 
 		if this.submitted {
-			let mut ring = this.ring.borrow_mut();
-			ring.submit().unwrap();
-			return Poll::Ready(());
+			return match ring.get_cqe(ptr::from_mut(this).cast()) {
+				Some(_cqe) => Poll::Ready(()),
+				None => {
+					ring.submit().unwrap();
+					cx.waker().wake_by_ref();
+					Poll::Pending
+				}
+			};
 		}
 
 		let nop: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
-		let sqe = unsafe { Sqe::new_without_callback(nop) };
+		let sqe = unsafe { Sqe::new(nop, ptr::from_mut(this).cast()) };
 
 		this.submitted = true;
 		this.ring.borrow_mut().push(sqe).unwrap();
