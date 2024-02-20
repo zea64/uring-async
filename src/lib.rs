@@ -6,7 +6,7 @@ use core::{
 	ffi::c_void,
 	fmt::{self, Debug},
 	mem::size_of,
-	ops::Rem,
+	ops::{Deref, DerefMut, Rem},
 	ptr::{self, NonNull},
 };
 
@@ -231,7 +231,7 @@ impl Uring {
 			.ready_cqes
 			.iter()
 			.enumerate()
-			.find(|cqe| cqe.1 .0.user_data.ptr() == user_data.cast())
+			.find(|cqe| cqe.1.user_data.ptr() == user_data.cast())
 			.map(|(index, _cqe)| index)?;
 		Some(self.ready_cqes.swap_remove(index))
 	}
@@ -272,7 +272,7 @@ impl Debug for Sqe {
 	}
 }
 
-impl core::ops::Deref for Sqe {
+impl Deref for Sqe {
 	type Target = io_uring_sqe;
 
 	fn deref(&self) -> &Self::Target {
@@ -280,9 +280,29 @@ impl core::ops::Deref for Sqe {
 	}
 }
 
+impl DerefMut for Sqe {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.0
+	}
+}
+
 #[repr(transparent)]
 #[derive(Debug, Default)]
 pub struct Cqe(io_uring_cqe);
+
+impl Deref for Cqe {
+	type Target = io_uring_cqe;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+impl DerefMut for Cqe {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		&mut self.0
+	}
+}
 
 #[cfg(test)]
 mod test {
