@@ -6,6 +6,7 @@ use core::{
 	ffi::c_void,
 	fmt::{self, Debug},
 	mem::size_of,
+	ops::Rem,
 	ptr::{self, NonNull},
 };
 
@@ -71,7 +72,14 @@ impl<T: Default + Debug> Queue<T> {
 	}
 
 	fn pop(&mut self) -> Option<T> {
-		let item = self.get_empty_nth(0)?;
+		if *self.our_ptr == *self.their_ptr {
+			return None;
+		}
+
+		let item = unsafe {
+			self.array
+				.get_unchecked((*self.our_ptr).rem(Uring::NR_SQ_ENTRIES) as usize)
+		};
 		// Effectively a `.take()`, but since we're never looking at that slot again there's no need to clear it.
 		let result = unsafe { ptr::read(item) };
 
