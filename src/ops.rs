@@ -29,6 +29,13 @@ impl<'a> Future for Nop<'a> {
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = Pin::into_inner(self);
+		let mut ring = match this.ring.try_borrow_mut() {
+			Ok(x) => x,
+			Err(_) => {
+				cx.waker().wake_by_ref();
+				return Poll::Pending;
+			}
+		};
 
 		if this.submitted {
 			return match ring.get_cqe(ptr::from_mut(this).cast()) {
@@ -45,7 +52,7 @@ impl<'a> Future for Nop<'a> {
 		let sqe = unsafe { Sqe::new(nop, ptr::from_mut(this).cast()) };
 
 		this.submitted = true;
-		this.ring.borrow_mut().push(sqe).unwrap();
+		ring.push(sqe).unwrap();
 
 		cx.waker().wake_by_ref();
 
