@@ -152,8 +152,9 @@ impl Uring {
 			)?;
 
 			// Map sq array position `i` to index `i` in entries array so we can just forget about it.
+			let sq_array: *mut u32 = queues_ptr.byte_offset(params.sq_off.array as isize).cast();
 			for i in 0..params.sq_entries {
-				*sq_entries_ptr.cast::<u32>().offset(i as isize) = i;
+				*sq_array.offset(i as isize) = i;
 			}
 
 			#[inline]
