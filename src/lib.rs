@@ -6,6 +6,7 @@ use core::{
 	ffi::c_void,
 	fmt::{self, Debug},
 	mem::size_of,
+	num::NonZeroU64,
 	ops::{Deref, DerefMut, Rem},
 	ptr::{self, NonNull},
 };
@@ -98,6 +99,7 @@ pub struct Uring {
 	queue_base: NonNull<u32>,
 	sq_entries: NonNull<Sqe>,
 	ready_cqes: Vec<Cqe>,
+	ticket: u64,
 }
 
 impl Uring {
@@ -190,6 +192,7 @@ impl Uring {
 				queue_base: NonNull::new_unchecked(queues_ptr.cast()),
 				queue_map_len: queue_map_len as u32,
 				ready_cqes: Vec::new(),
+				ticket: 0,
 			})
 		}
 	}
@@ -226,12 +229,18 @@ impl Uring {
 		Ok(submitted)
 	}
 
-	pub fn get_cqe(&mut self, user_data: *mut ()) -> Option<Cqe> {
+	pub fn get_ticket(&mut self) -> NonZeroU64 {
+		// At 10 billion additions per second, this would take 58 years to overflow.
+		self.ticket += 1;
+		NonZeroU64::new(self.ticket).unwrap()
+	}
+
+	pub fn get_cqe(&mut self, user_data: u64) -> Option<Cqe> {
 		let index = self
 			.ready_cqes
 			.iter()
 			.enumerate()
-			.find(|cqe| cqe.1.user_data.ptr() == user_data.cast())
+			.find(|cqe| cqe.1.user_data.u64_() == user_data)
 			.map(|(index, _cqe)| index)?;
 		Some(self.ready_cqes.swap_remove(index))
 	}
@@ -258,16 +267,20 @@ impl Drop for Uring {
 pub struct Sqe(io_uring_sqe);
 
 impl Sqe {
-	pub unsafe fn new(mut sqe: io_uring_sqe, user_data: *mut ()) -> Self {
-		sqe.user_data.ptr = io_uring_ptr::from(user_data.cast());
+	pub unsafe fn new(sqe: io_uring_sqe) -> Self {
 		Sqe(sqe)
+	}
+
+	pub fn set_user_data(mut self, user_data: u64) -> Self {
+		self.user_data = io_uring_user_data::from_u64(user_data);
+		self
 	}
 }
 
 impl Debug for Sqe {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("Sqe")
-			.field("user_data", &self.0.user_data.ptr())
+			.field("user_data", &self.user_data.ptr())
 			.finish()
 	}
 }
@@ -313,7 +326,7 @@ mod test {
 	fn new_nop() -> Sqe {
 		let mut a: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
 		a.opcode = IoringOp::Nop;
-		unsafe { Sqe::new(a, ptr::null_mut()) }
+		unsafe { Sqe::new(a) }
 	}
 
 	#[test]
