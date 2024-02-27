@@ -211,11 +211,13 @@ impl Uring {
 
 	pub fn submit(&mut self) -> PosixResult<u32> {
 		let to_submit = *self.sq.our_ptr - *self.sq.their_ptr;
+		let min = to_submit / 2 + 1;
+
 		let submitted = unsafe {
 			io_uring_enter(
 				&self.fd,
 				to_submit,
-				to_submit,
+				min,
 				IoringEnterFlags::GETEVENTS,
 				ptr::null(),
 				0,
