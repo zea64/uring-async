@@ -79,7 +79,7 @@ impl<T: Default + Debug> Queue<T> {
 
 		let item = unsafe {
 			self.array
-				.get_unchecked((*self.our_ptr).rem(Uring::NR_SQ_ENTRIES) as usize)
+				.get_unchecked((*self.our_ptr).rem(self.array.len() as u32) as usize)
 		};
 		// Effectively a `.take()`, but since we're never looking at that slot again there's no need to clear it.
 		let result = unsafe { ptr::read(item) };
