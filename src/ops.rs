@@ -55,7 +55,7 @@ impl<'a> Op<'a> {
 			return match ring.get_cqe(ticket.into()) {
 				Some(cqe) => Poll::Ready(cqe),
 				None => {
-					ring.submit().unwrap();
+					ring.want_submit().unwrap();
 					cx.waker().wake_by_ref();
 					Poll::Pending
 				}

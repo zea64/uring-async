@@ -3,6 +3,7 @@
 pub mod ops;
 
 use core::{
+	cmp::max,
 	ffi::c_void,
 	fmt::{self, Debug},
 	mem::size_of,
@@ -100,6 +101,8 @@ pub struct Uring {
 	sq_entries: NonNull<Sqe>,
 	ready_cqes: Vec<Cqe>,
 	ticket: u64,
+	in_flight: u32,
+	waiting_to_submit: u32,
 }
 
 impl Uring {
@@ -193,11 +196,16 @@ impl Uring {
 				queue_map_len: queue_map_len as u32,
 				ready_cqes: Vec::new(),
 				ticket: 0,
+				in_flight: 0,
+				waiting_to_submit: 0,
 			})
 		}
 	}
 
 	pub fn push(&mut self, mut sqe: Sqe) -> PosixResult<()> {
+		self.waiting_to_submit = 0;
+		self.in_flight += 1;
+
 		loop {
 			let x = self.sq.push(&mut sqe);
 
@@ -210,8 +218,13 @@ impl Uring {
 	}
 
 	pub fn submit(&mut self) -> PosixResult<u32> {
+		self.waiting_to_submit = 0;
+
 		let to_submit = *self.sq.our_ptr - *self.sq.their_ptr;
-		let min = to_submit / 2 + 1;
+		// Make sure there are at most `sq.len()` requests in flight after this. `cq.len()` defaults to `2*sq.len()`, so this guarantees that we won't overflow on next submit.
+		// This polynomial balances aggressively flushing as we approach filling the sq/cq, not just always returning 1 on low input, allowing some background work even at non-full queues, quickly filling up the queue as we recieve lots of requests (~7 submits to fill at `sq.len() == 4096`), and quickly draining the queue when no more requests are pushed (also ~7 submits).
+		let poly = |x, c| (x+c)*(x+c)/(8*c) - c/8;
+		let min = max(1, poly(self.in_flight, self.sq.len()));
 
 		let submitted = unsafe {
 			io_uring_enter(
@@ -225,10 +238,21 @@ impl Uring {
 		}?;
 
 		while let Some(cqe) = self.cq.pop() {
+			self.in_flight -= 1;
 			self.ready_cqes.push(Cqe(cqe));
 		}
 
 		Ok(submitted)
+	}
+
+	pub fn want_submit(&mut self) -> PosixResult<()> {
+		self.waiting_to_submit += 1;
+
+		if self.waiting_to_submit >= 3*self.in_flight/2 {
+			self.submit().map(|_| ())
+		} else {
+			Ok(())
+		}
 	}
 
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
