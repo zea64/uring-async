@@ -101,17 +101,18 @@ pub struct Openat<'a> {
 	path: &'a CStr,
 	flags: OFlags,
 	mode: Mode,
+	sqe_flags: IoringSqeFlags,
 }
 
 impl<'a> Future for Openat<'a> {
-	type Output = OwnedFd;
+	type Output = PosixResult<OwnedFd>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = Pin::into_inner(self);
 		let sqe_factory = || unsafe {
 			Sqe::new(io_uring_sqe {
 				opcode: IoringOp::Openat,
-				flags: IoringSqeFlags::empty(),
+				flags: this.sqe_flags,
 				ioprio: zero!(),
 				fd: this.dfd.as_raw_fd(),
 				off_or_addr2: zero!(),
@@ -134,7 +135,7 @@ impl<'a> Future for Openat<'a> {
 
 		this.op
 			.poll(cx, sqe_factory)
-			.map(|cqe| unsafe { OwnedFd::from_raw_fd(cqe.res) })
+			.map(|cqe| res_or_errno(cqe.res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }))
 	}
 }
 
@@ -145,6 +146,7 @@ impl<'a> Openat<'a> {
 		path: &'a CStr,
 		flags: OFlags,
 		mode: Mode,
+		sqe_flags: IoringSqeFlags,
 	) -> Self {
 		Openat {
 			op: Op::new(ring),
@@ -152,6 +154,68 @@ impl<'a> Openat<'a> {
 			path,
 			flags,
 			mode,
+			sqe_flags,
+		}
+	}
+}
+
+pub struct Openat2<'a> {
+	op: Op<'a>,
+	dfd: BorrowedFd<'a>,
+	path: &'a CStr,
+	open_how: &'a open_how,
+	sqe_flags: IoringSqeFlags,
+}
+
+impl<'a> Future for Openat2<'a> {
+	type Output = PosixResult<OwnedFd>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = Pin::into_inner(self);
+		let sqe_factory = || unsafe {
+			Sqe::new(io_uring_sqe {
+				opcode: IoringOp::Openat2,
+				flags: this.sqe_flags,
+				ioprio: zero!(),
+				fd: this.dfd.as_raw_fd(),
+				off_or_addr2: off_or_addr2_union {
+					addr2: io_uring_ptr::from(this.open_how as *const _ as *mut c_void),
+				},
+				addr_or_splice_off_in: addr_or_splice_off_in_union {
+					addr: io_uring_ptr::from(this.path.as_ptr() as *mut c_void),
+				},
+				len: len_union {
+					len: size_of::<open_how>() as u32,
+				},
+				op_flags: zero!(),
+				user_data: zero!(),
+				buf: zero!(),
+				personality: zero!(),
+				splice_fd_in_or_file_index: zero!(),
+				addr3_or_cmd: zero!(),
+			})
+		};
+
+		this.op
+			.poll(cx, sqe_factory)
+			.map(|cqe| res_or_errno(cqe.res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }))
+	}
+}
+
+impl<'a> Openat2<'a> {
+	pub fn new(
+		ring: &'a RefCell<Uring>,
+		dfd: BorrowedFd<'a>,
+		path: &'a CStr,
+		open_how: &'a open_how,
+		sqe_flags: IoringSqeFlags,
+	) -> Self {
+		Openat2 {
+			op: Op::new(ring),
+			dfd,
+			path,
+			open_how,
+			sqe_flags,
 		}
 	}
 }
@@ -160,6 +224,7 @@ pub struct Read<'a> {
 	op: Op<'a>,
 	buf: &'a mut [u8],
 	fd: BorrowedFd<'a>,
+	sqe_flags: IoringSqeFlags,
 }
 
 impl<'a> Future for Read<'a> {
@@ -170,7 +235,7 @@ impl<'a> Future for Read<'a> {
 		let sqe_factory = || unsafe {
 			Sqe::new(io_uring_sqe {
 				opcode: IoringOp::Read,
-				flags: IoringSqeFlags::empty(),
+				flags: this.sqe_flags,
 				ioprio: zero!(),
 				fd: this.fd.as_raw_fd(),
 				off_or_addr2: off_or_addr2_union { off: u64::MAX },
@@ -196,11 +261,17 @@ impl<'a> Future for Read<'a> {
 }
 
 impl<'a> Read<'a> {
-	pub fn new(ring: &'a RefCell<Uring>, fd: BorrowedFd<'a>, buf: &'a mut [u8]) -> Self {
+	pub fn new(
+		ring: &'a RefCell<Uring>,
+		fd: BorrowedFd<'a>,
+		buf: &'a mut [u8],
+		sqe_flags: IoringSqeFlags,
+	) -> Self {
 		Read {
 			op: Op::new(ring),
 			buf,
 			fd,
+			sqe_flags,
 		}
 	}
 }
@@ -253,7 +324,10 @@ mod test {
 	use core::{cell::RefCell, future::join};
 
 	use futures::executor::block_on;
-	use rustix::{fd::AsFd, fs};
+	use rustix::{
+		fd::AsFd,
+		fs::{self, ResolveFlags},
+	};
 
 	use crate::ops::*;
 
@@ -316,7 +390,33 @@ mod test {
 			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
 			OFlags::RDONLY,
 			Mode::empty(),
-		));
+			IoringSqeFlags::empty(),
+		))
+		.unwrap();
+
+		let mut buf = [1u8; 64];
+
+		let result = rustix::io::read(fd, &mut buf);
+		assert_eq!(result, Ok(64));
+		assert_eq!(buf, [0u8; 64]);
+	}
+
+	#[test]
+	fn openat2() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let fd = block_on(Openat2::new(
+			&ring,
+			fs::CWD,
+			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
+			&open_how {
+				flags: OFlags::RDONLY.bits() as u64,
+				mode: 0,
+				resolve: ResolveFlags::empty(),
+			},
+			IoringSqeFlags::empty(),
+		))
+		.unwrap();
 
 		let mut buf = [1u8; 64];
 
@@ -332,7 +432,12 @@ mod test {
 		let fd = fs::open("/dev/zero", OFlags::empty(), Mode::empty()).unwrap();
 		let mut buf = [1u8; 64];
 
-		let result = block_on(Read::new(&ring, fd.as_fd(), &mut buf));
+		let result = block_on(Read::new(
+			&ring,
+			fd.as_fd(),
+			&mut buf,
+			IoringSqeFlags::empty(),
+		));
 		assert_eq!(result, Ok(64));
 		assert_eq!(buf, [0u8; 64]);
 	}
