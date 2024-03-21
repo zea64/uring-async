@@ -95,7 +95,6 @@ impl<'a> Nop<'a> {
 	}
 }
 
-// TODO: Other options.
 pub struct Openat<'a> {
 	op: Op<'a>,
 	dfd: BorrowedFd<'a>,
