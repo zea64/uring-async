@@ -10,7 +10,7 @@ use core::{
 
 use rustix::{
 	fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-	fs::{Mode, OFlags},
+	fs::{self, AtFlags, Mode, OFlags, StatxFlags},
 	io::Errno,
 	io_uring::*,
 };
@@ -276,6 +276,74 @@ impl<'a> Read<'a> {
 	}
 }
 
+pub struct Statx<'a> {
+	op: Op<'a>,
+	dfd: BorrowedFd<'a>,
+	path: &'a CStr,
+	flags: AtFlags,
+	mask: StatxFlags,
+	sqe_flags: IoringSqeFlags,
+	statx: MaybeUninit<fs::Statx>,
+}
+
+impl<'a> Future for Statx<'a> {
+	type Output = PosixResult<fs::Statx>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = Pin::into_inner(self);
+		let sqe_factory = || unsafe {
+			Sqe::new(io_uring_sqe {
+				opcode: IoringOp::Statx,
+				flags: this.sqe_flags,
+				ioprio: zero!(),
+				fd: this.dfd.as_raw_fd(),
+				off_or_addr2: off_or_addr2_union {
+					addr2: io_uring_ptr::from(this.statx.as_ptr() as *mut c_void),
+				},
+				addr_or_splice_off_in: addr_or_splice_off_in_union {
+					addr: io_uring_ptr::from(this.path.as_ptr() as *mut c_void),
+				},
+				len: len_union {
+					len: this.mask.bits(),
+				},
+				op_flags: op_flags_union {
+					statx_flags: this.flags,
+				},
+				user_data: zero!(),
+				buf: zero!(),
+				personality: zero!(),
+				splice_fd_in_or_file_index: zero!(),
+				addr3_or_cmd: zero!(),
+			})
+		};
+
+		this.op
+			.poll(cx, sqe_factory)
+			.map(|cqe| res_or_errno(cqe.res).map(|_res| unsafe { this.statx.assume_init() }))
+	}
+}
+
+impl<'a> Statx<'a> {
+	fn new(
+		ring: &'a RefCell<Uring>,
+		dfd: BorrowedFd<'a>,
+		path: &'a CStr,
+		flags: AtFlags,
+		mask: StatxFlags,
+		sqe_flags: IoringSqeFlags,
+	) -> Self {
+		Statx {
+			op: Op::new(ring),
+			dfd,
+			path,
+			flags,
+			mask,
+			sqe_flags,
+			statx: MaybeUninit::zeroed(),
+		}
+	}
+}
+
 pub struct Close<'a> {
 	op: Op<'a>,
 	fd: RawFd,
@@ -440,6 +508,24 @@ mod test {
 		));
 		assert_eq!(result, Ok(64));
 		assert_eq!(buf, [0u8; 64]);
+	}
+
+	#[test]
+	fn statx() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let stat = block_on(Statx::new(
+			&ring,
+			fs::CWD,
+			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
+			AtFlags::empty(),
+			StatxFlags::ALL,
+			IoringSqeFlags::empty(),
+		))
+		.unwrap();
+
+		assert_eq!(stat.stx_rdev_major, 1);
+		assert_eq!(stat.stx_rdev_minor, 5);
 	}
 
 	#[test]
