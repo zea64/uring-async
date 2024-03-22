@@ -324,7 +324,7 @@ impl<'a> Future for Statx<'a> {
 }
 
 impl<'a> Statx<'a> {
-	fn new(
+	pub fn new(
 		ring: &'a RefCell<Uring>,
 		dfd: BorrowedFd<'a>,
 		path: &'a CStr,
