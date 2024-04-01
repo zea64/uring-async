@@ -6,11 +6,15 @@ use core::{
 	cmp::max,
 	ffi::c_void,
 	fmt::{self, Debug},
+	future::Future,
 	mem::size_of,
 	num::NonZeroU64,
 	ops::{Deref, DerefMut, Rem},
+	pin::Pin,
 	ptr::{self, NonNull},
+	task::{Context, Poll, Waker},
 };
+use std::{collections::VecDeque, sync::Mutex};
 
 use rustix::{
 	fd::OwnedFd,
@@ -18,6 +22,66 @@ use rustix::{
 	io_uring::*,
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
+
+#[derive(Debug)]
+struct SemaphoreInner {
+	used: usize,
+	limit: usize,
+	queue: VecDeque<Waker>,
+}
+
+#[derive(Debug)]
+pub struct SemaphoreGuard<'a> {
+	semaphor: &'a Semaphore,
+}
+
+impl Drop for SemaphoreGuard<'_> {
+	fn drop(&mut self) {
+		let mut inner = self.semaphor.inner.lock().unwrap();
+		inner.used = inner.used.checked_sub(1).expect("Semaphore underflow");
+		if let Some(waker) = inner.queue.pop_front() {
+			waker.wake();
+		}
+	}
+}
+
+#[derive(Debug)]
+pub struct Semaphore {
+	inner: Mutex<SemaphoreInner>,
+}
+
+impl<'a> Semaphore {
+	pub fn new(limit: usize) -> Self {
+		Semaphore {
+			inner: Mutex::new(SemaphoreInner {
+				used: 0,
+				limit,
+				queue: VecDeque::new(),
+			}),
+		}
+	}
+
+	pub async fn wait(&'a self) -> SemaphoreGuard<'a> {
+		self.await
+	}
+}
+
+impl<'a> Future for &'a Semaphore {
+	type Output = SemaphoreGuard<'a>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = Pin::into_inner(self);
+		let mut inner = this.inner.lock().unwrap();
+
+		if inner.used < inner.limit {
+			inner.used = inner.used.checked_add(1).expect("Semaphore overflow");
+			Poll::Ready(SemaphoreGuard { semaphor: this })
+		} else {
+			inner.queue.push_back(cx.waker().clone());
+			Poll::Pending
+		}
+	}
+}
 
 struct Queue<T: 'static + Debug> {
 	our_ptr: &'static mut u32,
@@ -345,7 +409,13 @@ impl DerefMut for Cqe {
 
 #[cfg(test)]
 mod test {
-	use core::mem::MaybeUninit;
+	use core::{
+		cell::RefCell,
+		future::{self, join},
+		mem::MaybeUninit,
+	};
+
+	use futures::executor::block_on;
 
 	use crate::*;
 
@@ -376,5 +446,28 @@ mod test {
 			ring.push(new_nop()).unwrap();
 		}
 		ring.submit().unwrap();
+	}
+
+	#[test]
+	fn semaphore() {
+		let semaphore = Semaphore::new(1);
+		let resource = RefCell::new(vec![]);
+
+		#[allow(clippy::await_holding_refcell_ref)]
+		async fn foo(semaphore: &Semaphore, resource: &RefCell<Vec<&'static str>>) {
+			semaphore.wait().await;
+			let mut locked = resource.borrow_mut();
+			locked.push("start");
+			// Nop
+			future::ready(()).await;
+			locked.push("end");
+		}
+
+		block_on(join!(
+			foo(&semaphore, &resource),
+			foo(&semaphore, &resource)
+		));
+
+		assert_eq!(resource.into_inner(), ["start", "end", "start", "end"]);
 	}
 }
