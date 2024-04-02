@@ -3,7 +3,6 @@
 pub mod ops;
 
 use core::{
-	cmp::max,
 	ffi::c_void,
 	fmt::{self, Debug},
 	future::Future,
@@ -285,16 +284,12 @@ impl Uring {
 		self.waiting_to_submit = 0;
 
 		let to_submit = *self.sq.our_ptr - *self.sq.their_ptr;
-		// Make sure there are at most `sq.len()` requests in flight after this. `cq.len()` defaults to `2*sq.len()`, so this guarantees that we won't overflow on next submit.
-		// This polynomial balances aggressively flushing as we approach filling the sq/cq, not just always returning 1 on low input, allowing some background work even at non-full queues, quickly filling up the queue as we recieve lots of requests (~7 submits to fill at `sq.len() == 4096`), and quickly draining the queue when no more requests are pushed (also ~7 submits).
-		let poly = |x, c| (x + c) * (x + c) / (8 * c) - c / 8;
-		let min = max(1, poly(self.in_flight, self.sq.len()));
 
 		let submitted = unsafe {
 			io_uring_enter(
 				&self.fd,
 				to_submit,
-				min,
+				1,
 				IoringEnterFlags::GETEVENTS,
 				ptr::null(),
 				0,
