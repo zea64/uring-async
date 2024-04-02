@@ -9,8 +9,8 @@ use core::{
 };
 
 use rustix::{
-	fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
-	fs::{self, AtFlags, Mode, OFlags, StatxFlags},
+	fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
+	fs::{self, AtFlags, StatxFlags},
 	io::Errno,
 	io_uring::*,
 };
@@ -32,45 +32,33 @@ fn res_or_errno(result: i32) -> Result<i32, Errno> {
 
 pub struct Op<'a> {
 	ring: &'a RefCell<Uring>,
-	ticket: Option<NonZeroU64>,
+	ticket: NonZeroU64,
 }
 
 impl<'a> Op<'a> {
-	pub fn new(ring: &'a RefCell<Uring>) -> Self {
-		Op { ring, ticket: None }
+	pub fn new(ring: &'a RefCell<Uring>, mut sqe: Sqe) -> Self {
+		let mut unlocked_ring = ring.borrow_mut();
+		let ticket = unlocked_ring.get_ticket();
+		sqe.user_data = io_uring_user_data::from_u64(ticket.into());
+		unlocked_ring.push(sqe).unwrap();
+		Op { ring, ticket }
 	}
 }
 
-impl<'a> Op<'a> {
-	pub fn poll(&mut self, cx: &mut Context<'_>, sqe_factory: impl FnOnce() -> Sqe) -> Poll<Cqe> {
-		let mut ring = match self.ring.try_borrow_mut() {
-			Ok(x) => x,
-			Err(_) => {
+impl<'a> Future for Op<'a> {
+	type Output = Cqe;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = Pin::into_inner(self);
+		let mut ring = this.ring.borrow_mut();
+		match ring.get_cqe(this.ticket.into()) {
+			Some(cqe) => Poll::Ready(cqe),
+			None => {
+				ring.want_submit().unwrap();
 				cx.waker().wake_by_ref();
-				return Poll::Pending;
+				Poll::Pending
 			}
-		};
-
-		if let Some(ticket) = self.ticket {
-			return match ring.get_cqe(ticket.into()) {
-				Some(cqe) => Poll::Ready(cqe),
-				None => {
-					ring.want_submit().unwrap();
-					cx.waker().wake_by_ref();
-					Poll::Pending
-				}
-			};
 		}
-
-		let ticket = ring.get_ticket();
-		self.ticket = Some(ticket);
-
-		ring.push(sqe_factory().set_user_data(ticket.into()))
-			.unwrap();
-
-		cx.waker().wake_by_ref();
-
-		Poll::Pending
 	}
 }
 
@@ -82,122 +70,27 @@ impl<'a> Future for Nop<'a> {
 	type Output = ();
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		Pin::into_inner(self)
-			.op
-			.poll(cx, || unsafe { Sqe::new(zero!()) })
-			.map(|_cqe| ())
+		Future::poll(Pin::new(&mut Pin::into_inner(self).op), cx).map(|_cqe| ())
 	}
 }
 
 impl<'a> Nop<'a> {
 	pub fn new(ring: &'a RefCell<Uring>) -> Self {
-		Nop { op: Op::new(ring) }
-	}
-}
-
-pub struct Openat<'a> {
-	op: Op<'a>,
-	dfd: BorrowedFd<'a>,
-	path: &'a CStr,
-	flags: OFlags,
-	mode: Mode,
-	sqe_flags: IoringSqeFlags,
-}
-
-impl<'a> Future for Openat<'a> {
-	type Output = PosixResult<OwnedFd>;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = Pin::into_inner(self);
-		let sqe_factory = || unsafe {
-			Sqe::new(io_uring_sqe {
-				opcode: IoringOp::Openat,
-				flags: this.sqe_flags,
-				ioprio: zero!(),
-				fd: this.dfd.as_raw_fd(),
-				off_or_addr2: zero!(),
-				addr_or_splice_off_in: addr_or_splice_off_in_union {
-					addr: io_uring_ptr::from(this.path.as_ptr() as *mut c_void),
-				},
-				len: len_union {
-					len: this.mode.bits(),
-				},
-				op_flags: op_flags_union {
-					open_flags: this.flags,
-				},
-				user_data: zero!(),
-				buf: zero!(),
-				personality: zero!(),
-				splice_fd_in_or_file_index: zero!(),
-				addr3_or_cmd: zero!(),
-			})
-		};
-
-		this.op
-			.poll(cx, sqe_factory)
-			.map(|cqe| res_or_errno(cqe.res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }))
-	}
-}
-
-impl<'a> Openat<'a> {
-	pub fn new(
-		ring: &'a RefCell<Uring>,
-		dfd: BorrowedFd<'a>,
-		path: &'a CStr,
-		flags: OFlags,
-		mode: Mode,
-		sqe_flags: IoringSqeFlags,
-	) -> Self {
-		Openat {
-			op: Op::new(ring),
-			dfd,
-			path,
-			flags,
-			mode,
-			sqe_flags,
+		Nop {
+			op: Op::new(ring, unsafe { Sqe::new(zero!()) }),
 		}
 	}
 }
 
 pub struct Openat2<'a> {
 	op: Op<'a>,
-	dfd: BorrowedFd<'a>,
-	path: &'a CStr,
-	open_how: &'a open_how,
-	sqe_flags: IoringSqeFlags,
 }
 
 impl<'a> Future for Openat2<'a> {
 	type Output = PosixResult<OwnedFd>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = Pin::into_inner(self);
-		let sqe_factory = || unsafe {
-			Sqe::new(io_uring_sqe {
-				opcode: IoringOp::Openat2,
-				flags: this.sqe_flags,
-				ioprio: zero!(),
-				fd: this.dfd.as_raw_fd(),
-				off_or_addr2: off_or_addr2_union {
-					addr2: io_uring_ptr::from(this.open_how as *const _ as *mut c_void),
-				},
-				addr_or_splice_off_in: addr_or_splice_off_in_union {
-					addr: io_uring_ptr::from(this.path.as_ptr() as *mut c_void),
-				},
-				len: len_union {
-					len: size_of::<open_how>() as u32,
-				},
-				op_flags: zero!(),
-				user_data: zero!(),
-				buf: zero!(),
-				personality: zero!(),
-				splice_fd_in_or_file_index: zero!(),
-				addr3_or_cmd: zero!(),
-			})
-		};
-
-		this.op
-			.poll(cx, sqe_factory)
+		Future::poll(Pin::new(&mut Pin::into_inner(self).op), cx)
 			.map(|cqe| res_or_errno(cqe.res).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }))
 	}
 }
@@ -211,52 +104,48 @@ impl<'a> Openat2<'a> {
 		sqe_flags: IoringSqeFlags,
 	) -> Self {
 		Openat2 {
-			op: Op::new(ring),
-			dfd,
-			path,
-			open_how,
-			sqe_flags,
+			op: Op::new(ring, unsafe {
+				Sqe::new(io_uring_sqe {
+					opcode: IoringOp::Openat2,
+					flags: sqe_flags,
+					ioprio: zero!(),
+					fd: dfd.as_raw_fd(),
+					off_or_addr2: off_or_addr2_union {
+						addr2: io_uring_ptr::from(open_how as *const _ as *mut c_void),
+					},
+					addr_or_splice_off_in: addr_or_splice_off_in_union {
+						addr: io_uring_ptr::from(path.as_ptr() as *mut c_void),
+					},
+					len: len_union {
+						len: size_of::<open_how>() as u32,
+					},
+					op_flags: zero!(),
+					user_data: zero!(),
+					buf: zero!(),
+					personality: zero!(),
+					splice_fd_in_or_file_index: zero!(),
+					addr3_or_cmd: zero!(),
+				})
+			}),
 		}
 	}
 }
 
 pub struct Read<'a> {
 	op: Op<'a>,
-	buf: &'a mut [u8],
-	fd: BorrowedFd<'a>,
-	sqe_flags: IoringSqeFlags,
+	buf: *mut u8,
 }
 
 impl<'a> Future for Read<'a> {
-	type Output = PosixResult<i32>;
+	type Output = PosixResult<&'a mut [u8]>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = Pin::into_inner(self);
-		let sqe_factory = || unsafe {
-			Sqe::new(io_uring_sqe {
-				opcode: IoringOp::Read,
-				flags: this.sqe_flags,
-				ioprio: zero!(),
-				fd: this.fd.as_raw_fd(),
-				off_or_addr2: off_or_addr2_union { off: u64::MAX },
-				addr_or_splice_off_in: addr_or_splice_off_in_union {
-					addr: io_uring_ptr::from(this.buf.as_mut_ptr().cast()),
-				},
-				len: len_union {
-					len: this.buf.len() as u32,
-				},
-				op_flags: zero!(),
-				user_data: zero!(),
-				buf: zero!(),
-				personality: zero!(),
-				splice_fd_in_or_file_index: zero!(),
-				addr3_or_cmd: zero!(),
+		Future::poll(Pin::new(&mut this.op), cx).map(|cqe| {
+			res_or_errno(cqe.res).map(|len| unsafe {
+				core::slice::from_raw_parts_mut(this.buf, len.try_into().unwrap())
 			})
-		};
-
-		this.op
-			.poll(cx, sqe_factory)
-			.map(|cqe| res_or_errno(cqe.res))
+		})
 	}
 }
 
@@ -264,62 +153,48 @@ impl<'a> Read<'a> {
 	pub fn new(
 		ring: &'a RefCell<Uring>,
 		fd: BorrowedFd<'a>,
-		buf: &'a mut [u8],
+		buf: &'a mut [MaybeUninit<u8>],
 		sqe_flags: IoringSqeFlags,
 	) -> Self {
 		Read {
-			op: Op::new(ring),
-			buf,
-			fd,
-			sqe_flags,
+			op: Op::new(ring, unsafe {
+				Sqe::new(io_uring_sqe {
+					opcode: IoringOp::Read,
+					flags: sqe_flags,
+					ioprio: zero!(),
+					fd: fd.as_raw_fd(),
+					off_or_addr2: off_or_addr2_union { off: u64::MAX },
+					addr_or_splice_off_in: addr_or_splice_off_in_union {
+						addr: io_uring_ptr::from(buf.as_mut_ptr().cast()),
+					},
+					len: len_union {
+						len: buf.len() as u32,
+					},
+					op_flags: zero!(),
+					user_data: zero!(),
+					buf: zero!(),
+					personality: zero!(),
+					splice_fd_in_or_file_index: zero!(),
+					addr3_or_cmd: zero!(),
+				})
+			}),
+			buf: buf.as_mut_ptr().cast(),
 		}
 	}
 }
 
 pub struct Statx<'a> {
 	op: Op<'a>,
-	dfd: BorrowedFd<'a>,
-	path: &'a CStr,
-	flags: AtFlags,
-	mask: StatxFlags,
-	sqe_flags: IoringSqeFlags,
-	statx: MaybeUninit<fs::Statx>,
+	buf: *mut fs::Statx,
 }
 
 impl<'a> Future for Statx<'a> {
-	type Output = PosixResult<fs::Statx>;
+	type Output = PosixResult<&'a mut fs::Statx>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = Pin::into_inner(self);
-		let sqe_factory = || unsafe {
-			Sqe::new(io_uring_sqe {
-				opcode: IoringOp::Statx,
-				flags: this.sqe_flags,
-				ioprio: zero!(),
-				fd: this.dfd.as_raw_fd(),
-				off_or_addr2: off_or_addr2_union {
-					addr2: io_uring_ptr::from(this.statx.as_ptr() as *mut c_void),
-				},
-				addr_or_splice_off_in: addr_or_splice_off_in_union {
-					addr: io_uring_ptr::from(this.path.as_ptr() as *mut c_void),
-				},
-				len: len_union {
-					len: this.mask.bits(),
-				},
-				op_flags: op_flags_union {
-					statx_flags: this.flags,
-				},
-				user_data: zero!(),
-				buf: zero!(),
-				personality: zero!(),
-				splice_fd_in_or_file_index: zero!(),
-				addr3_or_cmd: zero!(),
-			})
-		};
-
-		this.op
-			.poll(cx, sqe_factory)
-			.map(|cqe| res_or_errno(cqe.res).map(|_res| unsafe { this.statx.assume_init() }))
+		Future::poll(Pin::new(&mut this.op), cx)
+			.map(|cqe| res_or_errno(cqe.res).map(|_res| unsafe { &mut *this.buf }))
 	}
 }
 
@@ -330,50 +205,45 @@ impl<'a> Statx<'a> {
 		path: &'a CStr,
 		flags: AtFlags,
 		mask: StatxFlags,
+		buf: &'a mut MaybeUninit<fs::Statx>,
 		sqe_flags: IoringSqeFlags,
 	) -> Self {
 		Statx {
-			op: Op::new(ring),
-			dfd,
-			path,
-			flags,
-			mask,
-			sqe_flags,
-			statx: MaybeUninit::zeroed(),
+			op: Op::new(ring, unsafe {
+				Sqe::new(io_uring_sqe {
+					opcode: IoringOp::Statx,
+					flags: sqe_flags,
+					ioprio: zero!(),
+					fd: dfd.as_raw_fd(),
+					off_or_addr2: off_or_addr2_union {
+						addr2: io_uring_ptr::from(buf.as_ptr() as *mut c_void),
+					},
+					addr_or_splice_off_in: addr_or_splice_off_in_union {
+						addr: io_uring_ptr::from(path.as_ptr() as *mut c_void),
+					},
+					len: len_union { len: mask.bits() },
+					op_flags: op_flags_union { statx_flags: flags },
+					user_data: zero!(),
+					buf: zero!(),
+					personality: zero!(),
+					splice_fd_in_or_file_index: zero!(),
+					addr3_or_cmd: zero!(),
+				})
+			}),
+			buf: buf.as_mut_ptr().cast(),
 		}
 	}
 }
 
 pub struct Close<'a> {
 	op: Op<'a>,
-	fd: RawFd,
 }
 
 impl<'a> Future for Close<'a> {
 	type Output = PosixResult<()>;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = Pin::into_inner(self);
-		let sqe_factory = || unsafe {
-			Sqe::new(io_uring_sqe {
-				opcode: IoringOp::Close,
-				flags: IoringSqeFlags::empty(),
-				ioprio: zero!(),
-				fd: this.fd,
-				off_or_addr2: zero!(),
-				addr_or_splice_off_in: zero!(),
-				len: zero!(),
-				op_flags: zero!(),
-				user_data: zero!(),
-				buf: zero!(),
-				personality: zero!(),
-				splice_fd_in_or_file_index: zero!(),
-				addr3_or_cmd: zero!(),
-			})
-		};
-
-		this.op
-			.poll(cx, sqe_factory)
+		Future::poll(Pin::new(&mut Pin::into_inner(self).op), cx)
 			.map(|cqe| res_or_errno(cqe.res).map(|_res| ()))
 	}
 }
@@ -381,8 +251,23 @@ impl<'a> Future for Close<'a> {
 impl<'a> Close<'a> {
 	pub fn new(ring: &'a RefCell<Uring>, fd: OwnedFd) -> Self {
 		Close {
-			op: Op::new(ring),
-			fd: fd.into_raw_fd(),
+			op: Op::new(ring, unsafe {
+				Sqe::new(io_uring_sqe {
+					opcode: IoringOp::Close,
+					flags: IoringSqeFlags::empty(),
+					ioprio: zero!(),
+					fd: fd.into_raw_fd(),
+					off_or_addr2: zero!(),
+					addr_or_splice_off_in: zero!(),
+					len: zero!(),
+					op_flags: zero!(),
+					user_data: zero!(),
+					buf: zero!(),
+					personality: zero!(),
+					splice_fd_in_or_file_index: zero!(),
+					addr3_or_cmd: zero!(),
+				})
+			}),
 		}
 	}
 }
@@ -449,27 +334,6 @@ mod test {
 	}
 
 	#[test]
-	fn openat() {
-		let ring = RefCell::new(Uring::new().unwrap());
-
-		let fd = block_on(Openat::new(
-			&ring,
-			rustix::fs::CWD,
-			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
-			OFlags::RDONLY,
-			Mode::empty(),
-			IoringSqeFlags::empty(),
-		))
-		.unwrap();
-
-		let mut buf = [1u8; 64];
-
-		let result = rustix::io::read(fd, &mut buf);
-		assert_eq!(result, Ok(64));
-		assert_eq!(buf, [0u8; 64]);
-	}
-
-	#[test]
 	fn openat2() {
 		let ring = RefCell::new(Uring::new().unwrap());
 
@@ -498,21 +362,23 @@ mod test {
 		let ring = RefCell::new(Uring::new().unwrap());
 
 		let fd = fs::open("/dev/zero", OFlags::empty(), Mode::empty()).unwrap();
-		let mut buf = [1u8; 64];
+		let mut buf = [MaybeUninit::uninit(); 64];
 
 		let result = block_on(Read::new(
 			&ring,
 			fd.as_fd(),
 			&mut buf,
 			IoringSqeFlags::empty(),
-		));
-		assert_eq!(result, Ok(64));
-		assert_eq!(buf, [0u8; 64]);
+		))
+		.unwrap();
+		assert_eq!(result, [0u8; 64]);
 	}
 
 	#[test]
 	fn statx() {
 		let ring = RefCell::new(Uring::new().unwrap());
+
+		let mut buf = MaybeUninit::uninit();
 
 		let stat = block_on(Statx::new(
 			&ring,
@@ -520,6 +386,7 @@ mod test {
 			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
 			AtFlags::empty(),
 			StatxFlags::ALL,
+			&mut buf,
 			IoringSqeFlags::empty(),
 		))
 		.unwrap();
