@@ -3,6 +3,7 @@
 pub mod ops;
 
 use core::{
+	cell::RefCell,
 	ffi::c_void,
 	fmt::{self, Debug},
 	future::Future,
@@ -13,7 +14,7 @@ use core::{
 	ptr::{self, NonNull},
 	task::{Context, Poll, Waker},
 };
-use std::{collections::VecDeque, sync::Mutex};
+use std::collections::VecDeque;
 
 use rustix::{
 	fd::OwnedFd,
@@ -22,62 +23,111 @@ use rustix::{
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
 
+#[derive(Debug, Default)]
+struct EventInner {
+	queue: VecDeque<(*const (), Waker)>,
+	completed: Vec<*const ()>,
+}
+
+#[derive(Debug, Default)]
+struct Event(RefCell<EventInner>);
+
+impl<'a> Event {
+	fn new() -> Self {
+		Default::default()
+	}
+
+	fn listen(&'a self) -> EventListener<'a> {
+		EventListener {
+			event: self,
+			submitted: false,
+		}
+	}
+
+	fn notify(&self) -> bool {
+		let mut this = self.0.borrow_mut();
+		if let Some((ptr, waker)) = this.queue.pop_front() {
+			this.completed.push(ptr);
+			waker.wake_by_ref();
+			true
+		} else {
+			false
+		}
+	}
+}
+
+struct EventListener<'a> {
+	event: &'a Event,
+	submitted: bool,
+}
+
+impl<'a> Future for EventListener<'a> {
+	type Output = ();
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = Pin::into_inner(self);
+		let ptr = this as *mut _ as *const ();
+		let mut event = this.event.0.borrow_mut();
+
+		if !this.submitted {
+			this.submitted = true;
+			event
+				.queue
+				.push_back((this as *mut _ as *const (), cx.waker().clone()));
+			Poll::Pending
+		} else {
+			let index = match event.completed.iter().position(|&x| x == ptr) {
+				Some(x) => x,
+				None => return Poll::Pending,
+			};
+			event.completed.swap_remove(index);
+			Poll::Ready(())
+		}
+	}
+}
+
 #[derive(Debug)]
 struct SemaphoreInner {
 	used: usize,
 	limit: usize,
-	queue: VecDeque<Waker>,
 }
 
 #[derive(Debug)]
-pub struct SemaphoreGuard<'a> {
-	semaphor: &'a Semaphore,
-}
+pub struct SemaphoreGuard<'a>(&'a Semaphore);
 
 impl Drop for SemaphoreGuard<'_> {
 	fn drop(&mut self) {
-		let mut inner = self.semaphor.inner.lock().unwrap();
+		let mut inner = self.0.inner.borrow_mut();
 		inner.used = inner.used.checked_sub(1).expect("Semaphore underflow");
-		if let Some(waker) = inner.queue.pop_front() {
-			waker.wake();
-		}
+		self.0.event.notify();
 	}
 }
 
 #[derive(Debug)]
 pub struct Semaphore {
-	inner: Mutex<SemaphoreInner>,
+	inner: RefCell<SemaphoreInner>,
+	event: Event,
 }
 
 impl<'a> Semaphore {
 	pub fn new(limit: usize) -> Self {
 		Semaphore {
-			inner: Mutex::new(SemaphoreInner {
-				used: 0,
-				limit,
-				queue: VecDeque::new(),
-			}),
+			inner: RefCell::new(SemaphoreInner { used: 0, limit }),
+			event: Event::new(),
 		}
 	}
 
 	pub async fn wait(&'a self) -> SemaphoreGuard<'a> {
-		self.await
-	}
-}
+		loop {
+			{
+				let mut this = self.inner.borrow_mut();
+				if this.used < this.limit {
+					this.used += 1;
+					return SemaphoreGuard(self);
+				}
+			}
 
-impl<'a> Future for &'a Semaphore {
-	type Output = SemaphoreGuard<'a>;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		let this = Pin::into_inner(self);
-		let mut inner = this.inner.lock().unwrap();
-
-		if inner.used < inner.limit {
-			inner.used = inner.used.checked_add(1).expect("Semaphore overflow");
-			Poll::Ready(SemaphoreGuard { semaphor: this })
-		} else {
-			inner.queue.push_back(cx.waker().clone());
-			Poll::Pending
+			self.event.listen().await;
 		}
 	}
 }
@@ -448,14 +498,16 @@ mod test {
 		let semaphore = Semaphore::new(1);
 		let resource = RefCell::new(vec![]);
 
-		#[allow(clippy::await_holding_refcell_ref)]
 		async fn foo(semaphore: &Semaphore, resource: &RefCell<Vec<&'static str>>) {
 			semaphore.wait().await;
-			let mut locked = resource.borrow_mut();
-			locked.push("start");
+			{
+				resource.borrow_mut().push("start");
+			}
 			// Nop
 			future::ready(()).await;
-			locked.push("end");
+			{
+				resource.borrow_mut().push("end");
+			}
 		}
 
 		block_on(join!(
