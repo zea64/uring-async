@@ -214,8 +214,6 @@ pub struct Uring {
 	sq_entries: NonNull<Sqe>,
 	ready_cqes: Vec<Cqe>,
 	ticket: u64,
-	in_flight: u32,
-	waiting_to_submit: u32,
 }
 
 impl Uring {
@@ -309,16 +307,11 @@ impl Uring {
 				queue_map_len: queue_map_len as u32,
 				ready_cqes: Vec::new(),
 				ticket: 0,
-				in_flight: 0,
-				waiting_to_submit: 0,
 			})
 		}
 	}
 
 	pub fn push(&mut self, mut sqe: Sqe) -> PosixResult<()> {
-		self.waiting_to_submit = 0;
-		self.in_flight += 1;
-
 		loop {
 			let x = self.sq.push(&mut sqe);
 
@@ -326,20 +319,18 @@ impl Uring {
 				return Ok(());
 			}
 
-			self.submit()?;
+			self.submit(0)?;
 		}
 	}
 
-	pub fn submit(&mut self) -> PosixResult<u32> {
-		self.waiting_to_submit = 0;
-
+	pub fn submit(&mut self, min_completions: u32) -> PosixResult<u32> {
 		let to_submit = *self.sq.our_ptr - *self.sq.their_ptr;
 
 		let submitted = unsafe {
 			io_uring_enter(
 				&self.fd,
 				to_submit,
-				1,
+				core::cmp::min(min_completions, to_submit),
 				IoringEnterFlags::GETEVENTS,
 				ptr::null(),
 				0,
@@ -347,7 +338,6 @@ impl Uring {
 		}?;
 
 		while let Some(cqe) = self.cq.pop() {
-			self.in_flight -= 1;
 			self.ready_cqes.push(Cqe(cqe));
 		}
 
@@ -355,13 +345,7 @@ impl Uring {
 	}
 
 	pub fn want_submit(&mut self) -> PosixResult<()> {
-		self.waiting_to_submit += 1;
-
-		if self.waiting_to_submit >= 3 * self.in_flight / 2 {
-			self.submit().map(|_| ())
-		} else {
-			Ok(())
-		}
+		todo!()
 	}
 
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
@@ -480,7 +464,7 @@ mod test {
 		let mut ring = Uring::new().unwrap();
 
 		ring.push(new_nop()).unwrap();
-		ring.submit().unwrap();
+		ring.submit(0).unwrap();
 	}
 
 	#[test]
@@ -490,7 +474,7 @@ mod test {
 		for _ in 0..(4096 * 2 + 2) {
 			ring.push(new_nop()).unwrap();
 		}
-		ring.submit().unwrap();
+		ring.submit(0).unwrap();
 	}
 
 	#[test]
