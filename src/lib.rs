@@ -1,4 +1,4 @@
-#![feature(future_join)]
+#![feature(future_join, noop_waker)]
 
 pub mod ops;
 
@@ -14,11 +14,11 @@ use core::{
 	ptr::{self, NonNull},
 	task::{Context, Poll, Waker},
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use rustix::{
 	fd::OwnedFd,
-	io::Result as PosixResult,
+	io::{Errno, Result as PosixResult},
 	io_uring::*,
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
@@ -205,6 +205,12 @@ impl<T: Default + Debug> Queue<T> {
 }
 
 #[derive(Debug)]
+struct SubmissionData {
+	waker: Waker,
+	cqe: Option<Cqe>,
+}
+
+#[derive(Debug)]
 pub struct Uring {
 	fd: OwnedFd,
 	sq: Queue<Sqe>,
@@ -212,7 +218,7 @@ pub struct Uring {
 	queue_map_len: u32,
 	queue_base: NonNull<u32>,
 	sq_entries: NonNull<Sqe>,
-	ready_cqes: Vec<Cqe>,
+	submissions: HashMap<u64, SubmissionData>,
 	ticket: u64,
 }
 
@@ -305,7 +311,7 @@ impl Uring {
 				sq_entries: NonNull::new_unchecked(sq_entries_ptr.cast()),
 				queue_base: NonNull::new_unchecked(queues_ptr.cast()),
 				queue_map_len: queue_map_len as u32,
-				ready_cqes: Vec::new(),
+				submissions: HashMap::new(),
 				ticket: 0,
 			})
 		}
@@ -338,14 +344,14 @@ impl Uring {
 		}?;
 
 		while let Some(cqe) = self.cq.pop() {
-			self.ready_cqes.push(Cqe(cqe));
+			let ticket = cqe.user_data.u64_();
+			// Normally this should always be found, if not early return to tell the caller they fucked up.
+			let submission = self.submissions.get_mut(&ticket).ok_or(Errno::NOENT)?;
+			submission.cqe = Some(Cqe(cqe));
+			submission.waker.wake_by_ref();
 		}
 
 		Ok(submitted)
-	}
-
-	pub fn want_submit(&mut self) -> PosixResult<()> {
-		todo!()
 	}
 
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
@@ -354,14 +360,33 @@ impl Uring {
 		NonZeroU64::new(self.ticket).unwrap()
 	}
 
-	pub fn get_cqe(&mut self, user_data: u64) -> Option<Cqe> {
-		let index = self
-			.ready_cqes
-			.iter()
-			.enumerate()
-			.find(|cqe| cqe.1.user_data.u64_() == user_data)
-			.map(|(index, _cqe)| index)?;
-		Some(self.ready_cqes.swap_remove(index))
+	pub fn poll(&mut self, user_data: u64, context: Option<&Context>) -> Option<Cqe> {
+		let waker = context.map(|x| x.waker()).unwrap_or(Waker::noop());
+
+		match self.submissions.get_mut(&user_data) {
+			None => {
+				self.submissions.insert(
+					user_data,
+					SubmissionData {
+						waker: waker.clone(),
+						cqe: None,
+					},
+				);
+
+				None
+			}
+			Some(data) => {
+				if data.cqe.is_some() {
+					data.cqe.take()
+				} else {
+					if !data.waker.will_wake(waker) {
+						data.waker.clone_from(waker);
+					}
+
+					None
+				}
+			}
+		}
 	}
 }
 

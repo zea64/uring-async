@@ -51,13 +51,9 @@ impl<'a> Future for Op<'a> {
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
 		let this = Pin::into_inner(self);
 		let mut ring = this.ring.borrow_mut();
-		match ring.get_cqe(this.ticket.into()) {
+		match ring.poll(this.ticket.into(), Some(cx)) {
 			Some(cqe) => Poll::Ready(cqe),
-			None => {
-				ring.want_submit().unwrap();
-				cx.waker().wake_by_ref();
-				Poll::Pending
-			}
+			None => Poll::Pending,
 		}
 	}
 }
