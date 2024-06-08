@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 
 use rustix::{
 	fd::OwnedFd,
-	io::{Errno, Result as PosixResult},
+	io::Result as PosixResult,
 	io_uring::*,
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
@@ -219,6 +219,7 @@ pub struct Uring {
 	queue_base: NonNull<u32>,
 	sq_entries: NonNull<Sqe>,
 	submissions: HashMap<u64, SubmissionData>,
+	in_flight: u32,
 	ticket: u64,
 }
 
@@ -312,46 +313,58 @@ impl Uring {
 				queue_base: NonNull::new_unchecked(queues_ptr.cast()),
 				queue_map_len: queue_map_len as u32,
 				submissions: HashMap::new(),
+				in_flight: 0,
 				ticket: 0,
 			})
 		}
 	}
 
-	pub fn push(&mut self, mut sqe: Sqe) -> PosixResult<()> {
+	pub fn push(&mut self, mut sqe: Sqe) -> Option<()> {
+		self.in_flight += 1;
 		loop {
 			let x = self.sq.push(&mut sqe);
 
 			if x.is_ok() {
-				return Ok(());
+				return Some(());
 			}
 
 			self.submit(0)?;
 		}
 	}
 
-	pub fn submit(&mut self, min_completions: u32) -> PosixResult<u32> {
+	pub fn submit(&mut self, min_completions: u32) -> Option<u32> {
 		let to_submit = *self.sq.our_ptr - *self.sq.their_ptr;
+
+		if min_completions > self.in_flight {
+			return None;
+		}
 
 		let submitted = unsafe {
 			io_uring_enter(
 				&self.fd,
 				to_submit,
-				core::cmp::min(min_completions, to_submit),
+				min_completions,
 				IoringEnterFlags::GETEVENTS,
 				ptr::null(),
 				0,
 			)
-		}?;
+		}
+		.expect("io_uring_enter failed");
 
 		while let Some(cqe) = self.cq.pop() {
+			self.in_flight -= 1;
+
 			let ticket = cqe.user_data.u64_();
 			// Normally this should always be found, if not early return to tell the caller they fucked up.
-			let submission = self.submissions.get_mut(&ticket).ok_or(Errno::NOENT)?;
+			let submission = self
+				.submissions
+				.get_mut(&ticket)
+				.expect("request associated with cqe not found");
 			submission.cqe = Some(Cqe(cqe));
 			submission.waker.wake_by_ref();
 		}
 
-		Ok(submitted)
+		Some(submitted)
 	}
 
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
@@ -377,7 +390,10 @@ impl Uring {
 			}
 			Some(data) => {
 				if data.cqe.is_some() {
-					data.cqe.take()
+					let cqe = data.cqe.take();
+					self.submissions.remove(&user_data);
+
+					cqe
 				} else {
 					if !data.waker.will_wake(waker) {
 						data.waker.clone_from(waker);
