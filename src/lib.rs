@@ -486,17 +486,26 @@ mod test {
 	use core::{
 		cell::RefCell,
 		future::{self, join},
-		mem::MaybeUninit,
 	};
 
-	use futures::executor::block_on;
+	use futures::FutureExt;
 
 	use crate::*;
 
-	fn new_nop() -> Sqe {
-		let mut a: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
-		a.opcode = IoringOp::Nop;
-		unsafe { Sqe::new(a) }
+	fn block_on<F: Future>(ring: &RefCell<Uring>, fut: F) -> F::Output {
+		let poll = async {
+			loop {
+				let _ = ring.borrow_mut().submit(0);
+				let _ = core::future::ready(()).await;
+			}
+		};
+
+		futures::executor::block_on(async {
+			futures::select! {
+				ret = Box::pin(fut.fuse()) => ret,
+				_ = Box::pin(poll.fuse()) => unreachable!(),
+			}
+		})
 	}
 
 	#[test]
@@ -506,20 +515,27 @@ mod test {
 
 	#[test]
 	fn one_nop() {
-		let mut ring = Uring::new().unwrap();
+		let ring = RefCell::new(Uring::new().unwrap());
 
-		ring.push(new_nop()).unwrap();
-		ring.submit(0).unwrap();
+		block_on(&ring, async {
+			ops::Nop::new(&ring).await;
+		});
 	}
 
 	#[test]
 	fn many_nop() {
-		let mut ring = Uring::new().unwrap();
+		let ring = RefCell::new(Uring::new().unwrap());
 
-		for _ in 0..(4096 * 2 + 2) {
-			ring.push(new_nop()).unwrap();
-		}
-		ring.submit(0).unwrap();
+		block_on(&ring, async {
+			let mut arr = vec![];
+
+			for _ in 0..4096 {
+				arr.push(ops::Nop::new(&ring));
+			}
+			for nop in arr.iter_mut() {
+				nop.await;
+			}
+		})
 	}
 
 	#[test]
@@ -539,7 +555,7 @@ mod test {
 			}
 		}
 
-		block_on(join!(
+		futures::executor::block_on(join!(
 			foo(&semaphore, &resource),
 			foo(&semaphore, &resource)
 		));
