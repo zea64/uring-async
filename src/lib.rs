@@ -378,6 +378,7 @@ impl Uring {
 
 		match self.submissions.get_mut(&user_data) {
 			None => {
+				// First time polling, store the waker.
 				self.submissions.insert(
 					user_data,
 					SubmissionData {
@@ -389,12 +390,15 @@ impl Uring {
 				None
 			}
 			Some(data) => {
+				// Subsequent poll.
 				if data.cqe.is_some() {
+					// We have data for you!
 					let cqe = data.cqe.take();
 					self.submissions.remove(&user_data);
 
 					cqe
 				} else {
+					// No data yet :(
 					if !data.waker.will_wake(waker) {
 						data.waker.clone_from(waker);
 					}
