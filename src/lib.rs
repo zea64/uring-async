@@ -431,6 +431,9 @@ impl Drop for Uring {
 pub struct Sqe(io_uring_sqe);
 
 impl Sqe {
+	/// # Safety
+	/// These will be passed nearly unmodified to the io_uring subsystem.
+	/// These are effectively syscalls, follow the relevant safety info in the docs.
 	pub unsafe fn new(sqe: io_uring_sqe) -> Self {
 		Sqe(sqe)
 	}
