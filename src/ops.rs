@@ -30,6 +30,7 @@ fn res_or_errno(result: i32) -> Result<i32, Errno> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Op<'a> {
 	ring: &'a RefCell<Uring>,
 	ticket: NonZeroU64,
@@ -58,6 +59,7 @@ impl<'a> Future for Op<'a> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Nop<'a> {
 	op: Op<'a>,
 }
@@ -78,6 +80,7 @@ impl<'a> Nop<'a> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Openat2<'a> {
 	op: Op<'a>,
 }
@@ -127,6 +130,7 @@ impl<'a> Openat2<'a> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Read<'a> {
 	op: Op<'a>,
 	buf: *mut u8,
@@ -179,6 +183,7 @@ impl<'a> Read<'a> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Statx<'a> {
 	op: Op<'a>,
 	buf: *mut fs::Statx,
@@ -231,6 +236,7 @@ impl<'a> Statx<'a> {
 	}
 }
 
+#[derive(Debug)]
 pub struct Close<'a> {
 	op: Op<'a>,
 }
