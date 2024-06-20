@@ -320,7 +320,17 @@ impl Uring {
 	}
 
 	pub fn push(&mut self, mut sqe: Sqe) -> Option<()> {
-		self.in_flight += 1;
+		assert!(self
+			.submissions
+			.insert(
+				sqe.user_data.u64_(),
+				SubmissionData {
+					waker: Waker::noop().clone(),
+					cqe: None
+				}
+			)
+			.is_none());
+
 		loop {
 			let x = self.sq.push(&mut sqe);
 
@@ -334,6 +344,7 @@ impl Uring {
 
 	pub fn submit(&mut self, min_completions: u32) -> Option<u32> {
 		let to_submit = *self.sq.our_ptr - *self.sq.their_ptr;
+		self.in_flight += to_submit;
 
 		if min_completions > self.in_flight {
 			return None;
@@ -377,18 +388,7 @@ impl Uring {
 		let waker = context.map(|x| x.waker()).unwrap_or(Waker::noop());
 
 		match self.submissions.get_mut(&user_data) {
-			None => {
-				// First time polling, store the waker.
-				self.submissions.insert(
-					user_data,
-					SubmissionData {
-						waker: waker.clone(),
-						cqe: None,
-					},
-				);
-
-				None
-			}
+			None => panic!("request associated with user_data not found"),
 			Some(data) => {
 				// Subsequent poll.
 				if data.cqe.is_some() {
