@@ -119,6 +119,53 @@ impl<'a> Close<'a> {
 }
 
 #[derive(Debug)]
+pub struct Fadvise<'a> {
+	op: Op<'a>,
+}
+
+impl<'a> Future for Fadvise<'a> {
+	type Output = PosixResult<()>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		Future::poll(Pin::new(&mut Pin::into_inner(self).op), cx)
+			.map(|cqe| res_or_errno(cqe.res).map(|_res| ()))
+	}
+}
+
+impl<'a> Fadvise<'a> {
+	pub fn new(
+		ring: &'a RefCell<Uring>,
+		fd: BorrowedFd<'a>,
+		offset: u64,
+		len: u32,
+		advice: rustix::fs::Advice,
+		sqe_flags: IoringSqeFlags,
+	) -> Self {
+		Fadvise {
+			op: Op::new(ring, unsafe {
+				Sqe::new(io_uring_sqe {
+					opcode: IoringOp::Fadvise,
+					flags: sqe_flags,
+					ioprio: zero!(),
+					fd: fd.as_raw_fd(),
+					off_or_addr2: off_or_addr2_union { off: offset },
+					addr_or_splice_off_in: zero!(),
+					len: len_union { len },
+					op_flags: op_flags_union {
+						fadvise_advice: advice,
+					},
+					user_data: zero!(),
+					buf: zero!(),
+					personality: zero!(),
+					splice_fd_in_or_file_index: zero!(),
+					addr3_or_cmd: zero!(),
+				})
+			}),
+		}
+	}
+}
+
+#[derive(Debug)]
 pub struct Openat2<'a> {
 	op: Op<'a>,
 }
@@ -300,6 +347,25 @@ mod test {
 
 		let fd = fs::open("/dev/null", OFlags::empty(), Mode::empty()).unwrap();
 		block_on(&ring, Close::new(&ring, fd)).unwrap();
+	}
+
+	#[test]
+	fn fadvise() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let fd = fs::open("/dev/null", OFlags::empty(), Mode::empty()).unwrap();
+		block_on(
+			&ring,
+			Fadvise::new(
+				&ring,
+				fd.as_fd(),
+				0,
+				0,
+				Advice::Sequential,
+				IoringSqeFlags::empty(),
+			),
+		)
+		.unwrap();
 	}
 
 	#[test]
