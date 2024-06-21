@@ -81,6 +81,44 @@ impl<'a> Nop<'a> {
 }
 
 #[derive(Debug)]
+pub struct Close<'a> {
+	op: Op<'a>,
+}
+
+impl<'a> Future for Close<'a> {
+	type Output = PosixResult<()>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		Future::poll(Pin::new(&mut Pin::into_inner(self).op), cx)
+			.map(|cqe| res_or_errno(cqe.res).map(|_res| ()))
+	}
+}
+
+impl<'a> Close<'a> {
+	pub fn new(ring: &'a RefCell<Uring>, fd: OwnedFd) -> Self {
+		Close {
+			op: Op::new(ring, unsafe {
+				Sqe::new(io_uring_sqe {
+					opcode: IoringOp::Close,
+					flags: IoringSqeFlags::empty(),
+					ioprio: zero!(),
+					fd: fd.into_raw_fd(),
+					off_or_addr2: zero!(),
+					addr_or_splice_off_in: zero!(),
+					len: zero!(),
+					op_flags: zero!(),
+					user_data: zero!(),
+					buf: zero!(),
+					personality: zero!(),
+					splice_fd_in_or_file_index: zero!(),
+					addr3_or_cmd: zero!(),
+				})
+			}),
+		}
+	}
+}
+
+#[derive(Debug)]
 pub struct Openat2<'a> {
 	op: Op<'a>,
 }
@@ -236,44 +274,6 @@ impl<'a> Statx<'a> {
 	}
 }
 
-#[derive(Debug)]
-pub struct Close<'a> {
-	op: Op<'a>,
-}
-
-impl<'a> Future for Close<'a> {
-	type Output = PosixResult<()>;
-
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		Future::poll(Pin::new(&mut Pin::into_inner(self).op), cx)
-			.map(|cqe| res_or_errno(cqe.res).map(|_res| ()))
-	}
-}
-
-impl<'a> Close<'a> {
-	pub fn new(ring: &'a RefCell<Uring>, fd: OwnedFd) -> Self {
-		Close {
-			op: Op::new(ring, unsafe {
-				Sqe::new(io_uring_sqe {
-					opcode: IoringOp::Close,
-					flags: IoringSqeFlags::empty(),
-					ioprio: zero!(),
-					fd: fd.into_raw_fd(),
-					off_or_addr2: zero!(),
-					addr_or_splice_off_in: zero!(),
-					len: zero!(),
-					op_flags: zero!(),
-					user_data: zero!(),
-					buf: zero!(),
-					personality: zero!(),
-					splice_fd_in_or_file_index: zero!(),
-					addr3_or_cmd: zero!(),
-				})
-			}),
-		}
-	}
-}
-
 #[cfg(test)]
 mod test {
 	use core::{cell::RefCell, future::join};
@@ -336,6 +336,14 @@ mod test {
 	}
 
 	#[test]
+	fn close() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let fd = fs::open("/dev/null", OFlags::empty(), Mode::empty()).unwrap();
+		block_on(Close::new(&ring, fd)).unwrap();
+	}
+
+	#[test]
 	fn openat2() {
 		let ring = RefCell::new(Uring::new().unwrap());
 
@@ -395,13 +403,5 @@ mod test {
 
 		assert_eq!(stat.stx_rdev_major, 1);
 		assert_eq!(stat.stx_rdev_minor, 5);
-	}
-
-	#[test]
-	fn close() {
-		let ring = RefCell::new(Uring::new().unwrap());
-
-		let fd = fs::open("/dev/null", OFlags::empty(), Mode::empty()).unwrap();
-		block_on(Close::new(&ring, fd)).unwrap();
 	}
 }
