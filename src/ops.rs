@@ -276,15 +276,14 @@ impl<'a> Statx<'a> {
 
 #[cfg(test)]
 mod test {
-	use core::{cell::RefCell, future::join};
+	use core::cell::RefCell;
 
-	use futures::executor::block_on;
 	use rustix::{
 		fd::AsFd,
 		fs::{self, ResolveFlags},
 	};
 
-	use crate::ops::*;
+	use crate::{ops::*, test::block_on};
 
 	#[test]
 	fn nop() {
@@ -292,47 +291,7 @@ mod test {
 
 		let nop = Nop::new(&ring);
 
-		block_on(nop);
-	}
-
-	#[test]
-	fn two_nops() {
-		let ring = RefCell::new(Uring::new().unwrap());
-
-		let nop1 = Nop::new(&ring);
-		let nop2 = Nop::new(&ring);
-
-		block_on(join!(nop1, nop2));
-	}
-
-	#[test]
-	fn async_fn() {
-		async fn foo(ring: &RefCell<Uring>) {
-			println!("1");
-			let _ = Nop::new(ring).await;
-			println!("2");
-			let _ = Nop::new(ring).await;
-			println!("3");
-		}
-
-		let ring = RefCell::new(Uring::new().unwrap());
-
-		block_on(foo(&ring));
-	}
-
-	#[test]
-	fn two_async_fns() {
-		async fn foo(ring: &RefCell<Uring>) {
-			println!("1");
-			let _ = Nop::new(ring).await;
-			println!("2");
-			let _ = Nop::new(ring).await;
-			println!("3");
-		}
-
-		let ring = RefCell::new(Uring::new().unwrap());
-
-		block_on(join!(foo(&ring), foo(&ring)));
+		block_on(&ring, nop);
 	}
 
 	#[test]
@@ -340,24 +299,27 @@ mod test {
 		let ring = RefCell::new(Uring::new().unwrap());
 
 		let fd = fs::open("/dev/null", OFlags::empty(), Mode::empty()).unwrap();
-		block_on(Close::new(&ring, fd)).unwrap();
+		block_on(&ring, Close::new(&ring, fd)).unwrap();
 	}
 
 	#[test]
 	fn openat2() {
 		let ring = RefCell::new(Uring::new().unwrap());
 
-		let fd = block_on(Openat2::new(
+		let fd = block_on(
 			&ring,
-			fs::CWD,
-			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
-			&open_how {
-				flags: OFlags::RDONLY.bits() as u64,
-				mode: 0,
-				resolve: ResolveFlags::empty(),
-			},
-			IoringSqeFlags::empty(),
-		))
+			Openat2::new(
+				&ring,
+				fs::CWD,
+				CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
+				&open_how {
+					flags: OFlags::RDONLY.bits() as u64,
+					mode: 0,
+					resolve: ResolveFlags::empty(),
+				},
+				IoringSqeFlags::empty(),
+			),
+		)
 		.unwrap();
 
 		let mut buf = [1u8; 64];
@@ -374,12 +336,10 @@ mod test {
 		let fd = fs::open("/dev/zero", OFlags::empty(), Mode::empty()).unwrap();
 		let mut buf = [MaybeUninit::uninit(); 64];
 
-		let result = block_on(Read::new(
+		let result = block_on(
 			&ring,
-			fd.as_fd(),
-			&mut buf,
-			IoringSqeFlags::empty(),
-		))
+			Read::new(&ring, fd.as_fd(), &mut buf, IoringSqeFlags::empty()),
+		)
 		.unwrap();
 		assert_eq!(result, [0u8; 64]);
 	}
@@ -390,15 +350,18 @@ mod test {
 
 		let mut buf = MaybeUninit::uninit();
 
-		let stat = block_on(Statx::new(
+		let stat = block_on(
 			&ring,
-			fs::CWD,
-			CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
-			AtFlags::empty(),
-			StatxFlags::ALL,
-			&mut buf,
-			IoringSqeFlags::empty(),
-		))
+			Statx::new(
+				&ring,
+				fs::CWD,
+				CStr::from_bytes_with_nul(b"/dev/zero\0").unwrap(),
+				AtFlags::empty(),
+				StatxFlags::ALL,
+				&mut buf,
+				IoringSqeFlags::empty(),
+			),
+		)
 		.unwrap();
 
 		assert_eq!(stat.stx_rdev_major, 1);

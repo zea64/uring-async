@@ -495,7 +495,7 @@ mod test {
 
 	use crate::*;
 
-	fn block_on<F: Future>(ring: &RefCell<Uring>, fut: F) -> F::Output {
+	pub(crate) fn block_on<F: Future>(ring: &RefCell<Uring>, fut: F) -> F::Output {
 		let poll = async {
 			loop {
 				let _ = ring.borrow_mut().submit(0);
