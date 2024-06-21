@@ -499,7 +499,19 @@ mod test {
 		let poll = async {
 			loop {
 				let _ = ring.borrow_mut().submit(0);
-				let _ = core::future::ready(()).await;
+
+				// Dirty hack to return `Poll::Pending` once before continuing.
+				let mut number = 0;
+				futures::future::poll_fn(move |cx: &mut Context<'_>| -> Poll<()> {
+					if number == 1 {
+						Poll::Ready(())
+					} else {
+						number += 1;
+						cx.waker().wake_by_ref();
+						Poll::Pending
+					}
+				})
+				.await;
 			}
 		};
 
