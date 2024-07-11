@@ -383,6 +383,14 @@ impl Uring {
 		Some(submitted)
 	}
 
+	pub fn sq_enqueued(&self) -> u16 {
+		(*self.sq.our_ptr - *self.sq.their_ptr).try_into().unwrap()
+	}
+
+	pub fn cq_enqueued(&self) -> u16 {
+		(*self.cq.their_ptr - *self.cq.our_ptr).try_into().unwrap()
+	}
+
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
 		// At 10 billion additions per second, this would take 58 years to overflow.
 		self.ticket += 1;
@@ -489,6 +497,22 @@ impl DerefMut for Cqe {
 	}
 }
 
+pub fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
+	loop {
+		if let Poll::Ready(x) = Future::poll(
+			unsafe { Pin::new_unchecked(&mut fut) },
+			&mut Context::from_waker(Waker::noop()),
+		) {
+			break x;
+		}
+
+		let mut borrowed_ring = ring.borrow_mut();
+		if borrowed_ring.sq_enqueued() != 0 || borrowed_ring.in_flight != 0 {
+			borrowed_ring.submit(1);
+		}
+	}
+}
+
 #[cfg(test)]
 mod test {
 	use core::{
@@ -496,37 +520,7 @@ mod test {
 		future::{self, join},
 	};
 
-	use futures::FutureExt;
-
 	use crate::*;
-
-	pub(crate) fn block_on<F: Future>(ring: &RefCell<Uring>, fut: F) -> F::Output {
-		let poll = async {
-			loop {
-				let _ = ring.borrow_mut().submit(0);
-
-				// Dirty hack to return `Poll::Pending` once before continuing.
-				let mut number = 0;
-				futures::future::poll_fn(move |cx: &mut Context<'_>| -> Poll<()> {
-					if number == 1 {
-						Poll::Ready(())
-					} else {
-						number += 1;
-						cx.waker().wake_by_ref();
-						Poll::Pending
-					}
-				})
-				.await;
-			}
-		};
-
-		futures::executor::block_on(async {
-			futures::select! {
-				ret = Box::pin(fut.fuse()) => ret,
-				_ = Box::pin(poll.fuse()) => unreachable!(),
-			}
-		})
-	}
 
 	#[test]
 	fn new_ring() {

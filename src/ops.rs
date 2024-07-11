@@ -330,7 +330,7 @@ mod test {
 		fs::{self, ResolveFlags},
 	};
 
-	use crate::{ops::*, test::block_on};
+	use crate::{block_on, ops::*};
 
 	#[test]
 	fn nop() {
