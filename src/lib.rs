@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 
 use rustix::{
 	fd::OwnedFd,
-	io::Result as PosixResult,
+	io::{Errno, Result as PosixResult},
 	io_uring::*,
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
@@ -350,17 +350,22 @@ impl Uring {
 			return None;
 		}
 
-		let submitted = unsafe {
-			io_uring_enter(
-				&self.fd,
-				to_submit,
-				min_completions,
-				IoringEnterFlags::GETEVENTS,
-				ptr::null(),
-				0,
-			)
-		}
-		.expect("io_uring_enter failed");
+		let submitted = loop {
+			match unsafe {
+				io_uring_enter(
+					&self.fd,
+					to_submit,
+					min_completions,
+					IoringEnterFlags::GETEVENTS,
+					ptr::null(),
+					0,
+				)
+			} {
+				Ok(x) => break x,
+				Err(Errno::AGAIN | Errno::INTR) => continue,
+				x => x.expect("io_uring_enter failed"),
+			};
+		};
 
 		while let Some(cqe) = self.cq.pop() {
 			self.in_flight -= 1;
