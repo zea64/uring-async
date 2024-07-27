@@ -92,6 +92,7 @@ struct SemaphoreInner {
 	limit: usize,
 }
 
+#[must_use]
 #[derive(Debug)]
 pub struct SemaphoreGuard<'a>(&'a Semaphore);
 
