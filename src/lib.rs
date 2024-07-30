@@ -548,7 +548,7 @@ mod test {
 			for _ in 0..4096 {
 				arr.push(ops::Nop::new(&ring));
 			}
-			for nop in arr.iter_mut() {
+			for nop in arr {
 				nop.await;
 			}
 		})
