@@ -519,6 +519,7 @@ mod test {
 	use core::{
 		cell::RefCell,
 		future::{self, join},
+		time::Duration,
 	};
 
 	use crate::*;
@@ -558,13 +559,30 @@ mod test {
 		let semaphore = Semaphore::new(1);
 		let resource = RefCell::new(vec![]);
 
+		struct Delay(bool);
+
+		impl Future for Delay {
+			type Output = ();
+
+			fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+				let this = Pin::into_inner(self);
+				if this.0 {
+					return Poll::Ready(());
+				}
+
+				this.0 = true;
+				cx.waker().wake_by_ref();
+				Poll::Pending
+			}
+		}
+
 		async fn foo(semaphore: &Semaphore, resource: &RefCell<Vec<&'static str>>) {
-			semaphore.wait().await;
+			let _guard = semaphore.wait().await;
 			{
 				resource.borrow_mut().push("start");
 			}
 			// Nop
-			future::ready(()).await;
+			Delay(false).await;
 			{
 				resource.borrow_mut().push("end");
 			}
