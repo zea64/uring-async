@@ -23,6 +23,13 @@ use rustix::{
 	mm::{mmap, munmap, MapFlags, ProtFlags},
 };
 
+fn posix_result(ret: i32) -> PosixResult<u32> {
+	match ret {
+		x if x < 0 => Err(Errno::from_raw_os_error(-x)),
+		x => Ok(x as u32),
+	}
+}
+
 #[derive(Debug, Default)]
 struct EventInner {
 	queue: VecDeque<(*const (), Waker)>,

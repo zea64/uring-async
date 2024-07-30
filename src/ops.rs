@@ -8,7 +8,10 @@ use core::{
 	task::{Context, Poll},
 };
 
-use rustix::io_uring::*;
+use rustix::{
+	fd::{AsRawFd, BorrowedFd},
+	io_uring::*,
+};
 
 use crate::*;
 
@@ -120,9 +123,61 @@ unsafe impl<'a> UringOp<'a> for Nop<'a> {
 
 impl_intofuture!(Nop<'a>);
 
+#[derive(Debug)]
+pub struct Read<'a> {
+	ring: &'a RefCell<Uring>,
+	fd: BorrowedFd<'a>,
+	offset: u64,
+	buf: &'a mut [u8],
+}
+
+impl<'a> Read<'a> {
+	pub fn new(
+		ring: &'a RefCell<Uring>,
+		fd: BorrowedFd<'a>,
+		offset: u64,
+		buf: &'a mut [u8],
+	) -> Self {
+		Self {
+			ring,
+			fd,
+			buf,
+			offset,
+		}
+	}
+}
+
+unsafe impl<'a> UringOp<'a> for Read<'a> {
+	type Output = PosixResult<u32>;
+
+	fn into_sqe(self) -> (&'a RefCell<Uring>, io_uring_sqe) {
+		let mut sqe: io_uring_sqe = unsafe { zero!() };
+		sqe.opcode = IoringOp::Read;
+		sqe.fd = self.fd.as_raw_fd();
+		sqe.off_or_addr2 = off_or_addr2_union { off: self.offset };
+		sqe.addr_or_splice_off_in = addr_or_splice_off_in_union {
+			addr: io_uring_ptr {
+				ptr: self.buf.as_mut_ptr().cast(),
+			},
+		};
+		sqe.len = len_union {
+			len: self.buf.len().try_into().unwrap(),
+		};
+		(self.ring, sqe)
+	}
+
+	fn result_from_cqe(cqe: io_uring_cqe) -> Self::Output {
+		posix_result(cqe.res)
+	}
+}
+
+impl_intofuture!(Read<'a>);
+
 #[cfg(test)]
 mod test {
 	use core::cell::RefCell;
+
+	use rustix::{fd::AsFd, fs::open};
 
 	use crate::{block_on, ops::*};
 
@@ -132,5 +187,21 @@ mod test {
 		let nop = Nop::new(&ring);
 
 		block_on(&ring, nop.into_future());
+	}
+
+	#[test]
+	fn read() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let file = open("/dev/zero", OFlags::RDONLY, Mode::empty()).unwrap();
+		let mut buf = [1u8; 64];
+
+		let res = block_on(
+			&ring,
+			Read::new(&ring, file.as_fd(), 0, &mut buf).into_future(),
+		)
+		.unwrap();
+		assert_eq!(res as usize, buf.len());
+		assert_eq!(buf, [0u8; 64]);
 	}
 }
