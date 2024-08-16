@@ -27,7 +27,8 @@ macro_rules! zero {
 pub unsafe trait UringOp<'a> {
 	type Output;
 
-	fn into_sqe(self) -> (&'a RefCell<Uring>, io_uring_sqe);
+	fn ring(&self) -> &'a RefCell<Uring>;
+	fn into_sqe(self) -> io_uring_sqe;
 	fn result_from_cqe(cqe: io_uring_cqe) -> Self::Output;
 }
 
@@ -48,7 +49,8 @@ pub struct UringFuture<'a, T: UringOp<'a>>(InternalOp<'a>, PhantomData<T>);
 
 impl<'a, T: UringOp<'a>> UringFuture<'a, T> {
 	fn new(uring_op: T) -> Self {
-		let (ring, sqe) = uring_op.into_sqe();
+		let ring = uring_op.ring();
+		let sqe = uring_op.into_sqe();
 		Self(unsafe { InternalOp::new(ring, sqe) }, PhantomData)
 	}
 }
@@ -114,8 +116,12 @@ impl<'a> Nop<'a> {
 unsafe impl<'a> UringOp<'a> for Nop<'a> {
 	type Output = ();
 
-	fn into_sqe(self) -> (&'a RefCell<Uring>, io_uring_sqe) {
-		(self.ring, unsafe { zero!() })
+	fn ring(&self) -> &'a RefCell<Uring> {
+		self.ring
+	}
+
+	fn into_sqe(self) -> io_uring_sqe {
+		unsafe { zero!() }
 	}
 
 	fn result_from_cqe(_cqe: io_uring_cqe) -> Self::Output {}
@@ -150,7 +156,11 @@ impl<'a> Read<'a> {
 unsafe impl<'a> UringOp<'a> for Read<'a> {
 	type Output = PosixResult<u32>;
 
-	fn into_sqe(self) -> (&'a RefCell<Uring>, io_uring_sqe) {
+	fn ring(&self) -> &'a RefCell<Uring> {
+		self.ring
+	}
+
+	fn into_sqe(self) -> io_uring_sqe {
 		let mut sqe: io_uring_sqe = unsafe { zero!() };
 		sqe.opcode = IoringOp::Read;
 		sqe.fd = self.fd.as_raw_fd();
@@ -163,7 +173,7 @@ unsafe impl<'a> UringOp<'a> for Read<'a> {
 		sqe.len = len_union {
 			len: self.buf.len().try_into().unwrap(),
 		};
-		(self.ring, sqe)
+		sqe
 	}
 
 	fn result_from_cqe(cqe: io_uring_cqe) -> Self::Output {
