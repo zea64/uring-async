@@ -24,12 +24,25 @@ macro_rules! zero {
 /// # Safety
 /// This relies raw `io_uring_sqe` and provides a raw `io_uring_cqe`.
 /// Implementors of this trait must ensure their `into_sqe` doesn't violate memory safety when passed to io_uring and that they can safely create an output in `result_from_cqe`.
-pub unsafe trait UringOp<'a> {
+pub unsafe trait UringOp<'a>: Sized {
 	type Output;
 
 	fn ring(&self) -> &'a RefCell<Uring>;
 	fn into_sqe(self) -> io_uring_sqe;
 	fn result_from_cqe(cqe: io_uring_cqe) -> Self::Output;
+
+	fn build(self) -> UringFuture<'a, Self> {
+		UringFuture::new(self)
+	}
+	fn link(self) -> UringFuture<'a, Self> {
+		UringFuture::new_link(self)
+	}
+	fn hardlink(self) -> UringFuture<'a, Self> {
+		UringFuture::new_hardlink(self)
+	}
+	fn drain(self) -> UringFuture<'a, Self> {
+		UringFuture::new_drain(self)
+	}
 }
 
 macro_rules! impl_intofuture {
@@ -51,6 +64,27 @@ impl<'a, T: UringOp<'a>> UringFuture<'a, T> {
 	fn new(uring_op: T) -> Self {
 		let ring = uring_op.ring();
 		let sqe = uring_op.into_sqe();
+		Self(unsafe { InternalOp::new(ring, sqe) }, PhantomData)
+	}
+
+	fn new_link(uring_op: T) -> Self {
+		let ring = uring_op.ring();
+		let mut sqe = uring_op.into_sqe();
+		sqe.flags |= IoringSqeFlags::IO_LINK;
+		Self(unsafe { InternalOp::new(ring, sqe) }, PhantomData)
+	}
+
+	fn new_hardlink(uring_op: T) -> Self {
+		let ring = uring_op.ring();
+		let mut sqe = uring_op.into_sqe();
+		sqe.flags |= IoringSqeFlags::IO_HARDLINK;
+		Self(unsafe { InternalOp::new(ring, sqe) }, PhantomData)
+	}
+
+	fn new_drain(uring_op: T) -> Self {
+		let ring = uring_op.ring();
+		let mut sqe = uring_op.into_sqe();
+		sqe.flags |= IoringSqeFlags::IO_DRAIN;
 		Self(unsafe { InternalOp::new(ring, sqe) }, PhantomData)
 	}
 }
@@ -187,9 +221,45 @@ impl_intofuture!(Read<'a>);
 mod test {
 	use core::cell::RefCell;
 
-	use rustix::{fd::AsFd, fs::open};
+	use rustix::{fd::AsFd, fs::open, io::write, pipe::pipe};
 
 	use crate::{block_on, ops::*};
+
+	#[test]
+	fn link() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let (rx, tx) = pipe().unwrap();
+		let tx = tx.as_fd();
+		let rx = rx.as_fd();
+
+		let mut b1 = [0];
+		let r1 = Read::new(&ring, rx, u64::MAX, &mut b1).link();
+		let mut b2 = [0];
+		let r2 = Read::new(&ring, rx, u64::MAX, &mut b2).hardlink();
+		let mut b3 = [0];
+		let r3 = Read::new(&ring, rx, u64::MAX, &mut b3).drain();
+		let mut b4 = [0];
+		let r4 = Read::new(&ring, rx, u64::MAX, &mut b4).build();
+
+		ring.borrow_mut().submit(0);
+
+		for i in 1..=5 {
+			write(tx, &[i]).unwrap();
+		}
+
+		block_on(&ring, async {
+			r1.await.unwrap();
+			r2.await.unwrap();
+			r3.await.unwrap();
+			r4.await.unwrap();
+		});
+
+		assert_eq!(b1, [1]);
+		assert_eq!(b2, [2]);
+		assert_eq!(b3, [3]);
+		assert_eq!(b4, [4]);
+	}
 
 	#[test]
 	fn nop() {
