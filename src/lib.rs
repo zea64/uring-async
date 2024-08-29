@@ -290,6 +290,10 @@ impl Uring {
 		(*self.cq.their_ptr - *self.cq.our_ptr).try_into().unwrap()
 	}
 
+	pub fn in_flight(&self) -> u32 {
+		self.in_flight
+	}
+
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
 		// At 10 billion additions per second, this would take 58 years to overflow.
 		self.ticket += 1;
