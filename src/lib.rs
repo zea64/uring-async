@@ -294,6 +294,10 @@ impl Uring {
 		self.in_flight
 	}
 
+	pub fn map_entries(&self) -> usize {
+		self.submissions.len()
+	}
+
 	pub fn get_ticket(&mut self) -> NonZeroU64 {
 		// At 10 billion additions per second, this would take 58 years to overflow.
 		self.ticket += 1;

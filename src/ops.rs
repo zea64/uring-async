@@ -3,7 +3,7 @@ use core::{
 	ffi::CStr,
 	future::{Future, IntoFuture},
 	marker::PhantomData,
-	mem::MaybeUninit,
+	mem::{ManuallyDrop, MaybeUninit},
 	num::NonZeroU64,
 	pin::Pin,
 	task::{Context, Poll},
@@ -133,8 +133,49 @@ impl<'a> Future for InternalOp<'a> {
 
 		match this.ring.borrow_mut().poll(ticket.into(), Some(cx)) {
 			None => Poll::Pending,
-			Some(cqe) => Poll::Ready(cqe.0),
+			Some(cqe) => {
+				this.ticket = None;
+				Poll::Ready(cqe.0)
+			}
 		}
+	}
+}
+
+impl<'a> Drop for InternalOp<'a> {
+	fn drop(&mut self) {
+		let ticket = match self.ticket {
+			Some(t) => t,
+			None => return,
+		};
+
+		let mut sqe: io_uring_sqe = unsafe { zero!() };
+		sqe.opcode = IoringOp::AsyncCancel;
+		sqe.fd = -1;
+		sqe.addr_or_splice_off_in = addr_or_splice_off_in_union {
+			addr: io_uring_ptr::from(ticket.get() as *mut _),
+		};
+		sqe.op_flags = op_flags_union {
+			cancel_flags: IoringAsyncCancelFlags::empty(),
+		};
+
+		fn inner_block_on<F: Future>(ring: &RefCell<Uring>, fut: &mut F) {
+			let mut cx = Context::from_waker(Waker::noop());
+			loop {
+				let f = unsafe { Pin::new_unchecked(&mut *fut) };
+
+				if Future::poll(f, &mut cx).is_ready() {
+					break;
+				} else {
+					ring.borrow_mut().submit(1);
+				}
+			}
+		}
+
+		let mut cancel = ManuallyDrop::new(unsafe { InternalOp::new(self.ring, sqe) });
+
+		inner_block_on(self.ring, cancel.deref_mut());
+		// Wait for original op to finish, whether by fully completing or being canceled.
+		inner_block_on(self.ring, self);
 	}
 }
 
@@ -422,7 +463,7 @@ impl_intofuture!(Statx<'a>);
 
 #[cfg(test)]
 mod test {
-	use core::cell::RefCell;
+	use core::{cell::RefCell, hint::black_box};
 
 	use ops::Statx;
 	use rustix::{
@@ -433,6 +474,34 @@ mod test {
 	};
 
 	use crate::{block_on, ops::*};
+
+	#[test]
+	fn op_drop() {
+		let ring = RefCell::new(Uring::new().unwrap());
+
+		let file = fs::open("/dev/zero", OFlags::RDONLY, Mode::empty()).unwrap();
+		let mut buf = [1];
+
+		let read = Read::new(&ring, file.as_fd(), 0, &mut buf).build();
+		// Note: `read` is not submitted yet because the queue hasn't filled up and nothing's awaiting.
+
+		drop(read);
+		let buf_before = buf;
+
+		{
+			// Submit everything in the sq.
+			let mut borrowed = ring.borrow_mut();
+			let enqueued = borrowed.sq_enqueued().into();
+			borrowed.submit(enqueued);
+		}
+
+		// idk if the compiler will try to merge this next assert with the previous.
+		black_box(&mut buf);
+
+		assert_eq!(buf, buf_before);
+		// Also make sure it doesn't leak.
+		assert_eq!(ring.borrow_mut().map_entries(), 0);
+	}
 
 	#[test]
 	fn link() {
