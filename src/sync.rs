@@ -45,7 +45,7 @@ struct EventListener<'a> {
 	submitted: bool,
 }
 
-impl<'a> Future for EventListener<'a> {
+impl Future for EventListener<'_> {
 	type Output = ();
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

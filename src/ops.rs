@@ -119,7 +119,7 @@ impl<'a> InternalOp<'a> {
 	}
 }
 
-impl<'a> Future for InternalOp<'a> {
+impl Future for InternalOp<'_> {
 	type Output = io_uring_cqe;
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -141,7 +141,7 @@ impl<'a> Future for InternalOp<'a> {
 	}
 }
 
-impl<'a> Drop for InternalOp<'a> {
+impl Drop for InternalOp<'_> {
 	fn drop(&mut self) {
 		let ticket = match self.ticket {
 			Some(t) => t,
