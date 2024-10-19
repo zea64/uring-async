@@ -1,11 +1,10 @@
 use core::{
 	cell::RefCell,
+	future::Future,
 	pin::Pin,
 	task::{Context, Poll, Waker},
 };
 use std::collections::VecDeque;
-
-use futures::Future;
 
 #[derive(Debug, Default)]
 struct EventInner {
@@ -122,6 +121,7 @@ mod test {
 	use core::future::join;
 
 	use super::*;
+	use crate::Uring;
 
 	#[test]
 	fn semaphore() {
@@ -157,10 +157,12 @@ mod test {
 			}
 		}
 
-		futures::executor::block_on(join!(
-			foo(&semaphore, &resource),
-			foo(&semaphore, &resource)
-		));
+		let dummy_ring = RefCell::new(Uring::new().unwrap());
+
+		crate::block_on(
+			&dummy_ring,
+			join!(foo(&semaphore, &resource), foo(&semaphore, &resource)),
+		);
 
 		assert_eq!(resource.into_inner(), ["start", "end", "start", "end"]);
 	}

@@ -6,7 +6,6 @@ rust-version = "1.84"
 
 [dependencies]
 rustix = { version = "0.38", features = ["io_uring", "mm"] }
-futures = { version = "0.3.30", features = ["executor"] }
 
 [dev-dependencies]
 rustix = { version = "0.38", features = ["pipe"] }
