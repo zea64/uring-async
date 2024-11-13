@@ -1,7 +1,7 @@
 use core::{
 	cell::RefCell,
 	ffi::CStr,
-	future::{Future, IntoFuture},
+	future::Future,
 	marker::PhantomData,
 	mem::{ManuallyDrop, MaybeUninit},
 	num::NonZeroU64,
@@ -33,7 +33,7 @@ pub unsafe trait UringOp<'a>: Sized {
 	fn into_sqe(self) -> io_uring_sqe;
 	fn result_from_cqe(cqe: io_uring_cqe) -> Self::Output;
 
-	fn build(self) -> UringFuture<'a, Self> {
+	fn build(self, _: IPromsieNotToMemForget) -> UringFuture<'a, Self> {
 		UringFuture::new(self)
 	}
 	fn link(self) -> UringFuture<'a, Self> {
@@ -45,19 +45,6 @@ pub unsafe trait UringOp<'a>: Sized {
 	fn drain(self) -> UringFuture<'a, Self> {
 		UringFuture::new_drain(self)
 	}
-}
-
-macro_rules! impl_intofuture {
-	($t:ty) => {
-		impl<'a> IntoFuture for $t {
-			type IntoFuture = UringFuture<'a, $t>;
-			type Output = <$t as UringOp<'a>>::Output;
-
-			fn into_future(self) -> Self::IntoFuture {
-				UringFuture::new(self)
-			}
-		}
-	};
 }
 
 pub struct UringFuture<'a, T: UringOp<'a>>(InternalOp<'a>, PhantomData<T>);
@@ -204,8 +191,6 @@ unsafe impl<'a> UringOp<'a> for Nop<'a> {
 	fn result_from_cqe(_cqe: io_uring_cqe) -> Self::Output {}
 }
 
-impl_intofuture!(Nop<'a>);
-
 #[derive(Debug)]
 pub struct Close<'a> {
 	ring: &'a RefCell<Uring>,
@@ -234,8 +219,6 @@ unsafe impl<'a> UringOp<'a> for Close<'a> {
 
 	fn result_from_cqe(_cqe: io_uring_cqe) -> Self::Output {}
 }
-
-impl_intofuture!(Close<'a>);
 
 #[derive(Debug)]
 pub struct Fadvise<'a> {
@@ -287,8 +270,6 @@ unsafe impl<'a> UringOp<'a> for Fadvise<'a> {
 		posix_result(cqe.res).map(|_| ())
 	}
 }
-
-impl_intofuture!(Fadvise<'a>);
 
 #[derive(Debug)]
 pub struct Openat2<'a> {
@@ -342,8 +323,6 @@ unsafe impl<'a> UringOp<'a> for Openat2<'a> {
 	}
 }
 
-impl_intofuture!(Openat2<'a>);
-
 #[derive(Debug)]
 pub struct Read<'a> {
 	ring: &'a RefCell<Uring>,
@@ -395,8 +374,6 @@ unsafe impl<'a> UringOp<'a> for Read<'a> {
 		posix_result(cqe.res)
 	}
 }
-
-impl_intofuture!(Read<'a>);
 
 #[derive(Debug)]
 pub struct Statx<'a> {
@@ -459,8 +436,6 @@ unsafe impl<'a> UringOp<'a> for Statx<'a> {
 	}
 }
 
-impl_intofuture!(Statx<'a>);
-
 #[cfg(test)]
 mod test {
 	use core::{cell::RefCell, hint::black_box};
@@ -478,11 +453,12 @@ mod test {
 	#[test]
 	fn op_drop() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		let file = fs::open("/dev/zero", OFlags::RDONLY, Mode::empty()).unwrap();
 		let mut buf = [1];
 
-		let read = Read::new(&ring, file.as_fd(), 0, &mut buf).build();
+		let read = Read::new(&ring, file.as_fd(), 0, &mut buf).build(pinky_promise);
 		// Note: `read` is not submitted yet because the queue hasn't filled up and nothing's awaiting.
 
 		drop(read);
@@ -504,8 +480,39 @@ mod test {
 	}
 
 	#[test]
+	#[ignore]
+	fn op_forget() {
+		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
+
+		let file = fs::open("/dev/zero", OFlags::RDONLY, Mode::empty()).unwrap();
+		let mut buf = [1];
+
+		let read = Read::new(&ring, file.as_fd(), 0, &mut buf).build(pinky_promise);
+		// Note: `read` is not submitted yet because the queue hasn't filled up and nothing's awaiting.
+
+		core::mem::forget(read);
+		let buf_before = buf;
+
+		{
+			// Submit everything in the sq.
+			let mut borrowed = ring.borrow_mut();
+			let enqueued = borrowed.sq_enqueued().into();
+			borrowed.submit(enqueued);
+		}
+
+		// idk if the compiler will try to merge this next assert with the previous.
+		black_box(&mut buf);
+
+		assert_eq!(buf, buf_before);
+		// Also make sure it doesn't leak.
+		assert_eq!(ring.borrow_mut().map_entries(), 0);
+	}
+
+	#[test]
 	fn link() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		let (rx, tx) = pipe().unwrap();
 		let tx = tx.as_fd();
@@ -518,7 +525,7 @@ mod test {
 		let mut b3 = [0];
 		let r3 = Read::new(&ring, rx, u64::MAX, &mut b3).drain();
 		let mut b4 = [0];
-		let r4 = Read::new(&ring, rx, u64::MAX, &mut b4).build();
+		let r4 = Read::new(&ring, rx, u64::MAX, &mut b4).build(pinky_promise);
 
 		ring.borrow_mut().submit(0);
 
@@ -542,14 +549,16 @@ mod test {
 	#[test]
 	fn nop() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 		let nop = Nop::new(&ring);
 
-		block_on(&ring, nop.into_future());
+		block_on(&ring, nop.build(pinky_promise));
 	}
 
 	#[test]
 	fn close() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		// It's important that the path be to a unique inode because this races with other tests opening files.
 		let fd = fs::open("/dev/mem", OFlags::PATH, Mode::empty()).unwrap();
@@ -557,7 +566,7 @@ mod test {
 			.unwrap()
 			.st_ino;
 
-		block_on(&ring, Close::new(&ring, fd).into_future());
+		block_on(&ring, Close::new(&ring, fd).build(pinky_promise));
 
 		let new_fd = open("/dev/mem", OFlags::PATH, Mode::empty()).unwrap();
 
@@ -571,11 +580,12 @@ mod test {
 	#[test]
 	fn fadvise() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 		let fd = fs::open("/dev/zero", OFlags::RDONLY, Mode::empty()).unwrap();
 
 		let ret = block_on(
 			&ring,
-			Fadvise::new(&ring, fd.as_fd(), 0, 0, Advice::Random).into_future(),
+			Fadvise::new(&ring, fd.as_fd(), 0, 0, Advice::Random).build(pinky_promise),
 		);
 		assert!(ret.is_ok());
 	}
@@ -583,6 +593,7 @@ mod test {
 	#[test]
 	fn openat2() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		let how = open_how {
 			flags: OFlags::RDONLY.bits().into(),
@@ -591,7 +602,7 @@ mod test {
 		};
 		let fd = block_on(
 			&ring,
-			Openat2::new(&ring, CWD, c"/dev/null", &how).into_future(),
+			Openat2::new(&ring, CWD, c"/dev/null", &how).build(pinky_promise),
 		)
 		.unwrap();
 
@@ -601,13 +612,14 @@ mod test {
 	#[test]
 	fn read() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		let file = fs::open("/dev/zero", OFlags::RDONLY, Mode::empty()).unwrap();
 		let mut buf = [1u8; 64];
 
 		let res = block_on(
 			&ring,
-			Read::new(&ring, file.as_fd(), 0, &mut buf).into_future(),
+			Read::new(&ring, file.as_fd(), 0, &mut buf).build(pinky_promise),
 		)
 		.unwrap();
 		assert_eq!(res as usize, buf.len());
@@ -617,6 +629,7 @@ mod test {
 	#[test]
 	fn statx() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		let mut buf = unsafe { zero!() };
 		block_on(
@@ -629,7 +642,7 @@ mod test {
 				StatxFlags::BASIC_STATS,
 				&mut buf,
 			)
-			.into_future(),
+			.build(pinky_promise),
 		)
 		.unwrap();
 

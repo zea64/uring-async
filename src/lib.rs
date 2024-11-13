@@ -420,11 +420,25 @@ pub fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
 	}
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct IPromsieNotToMemForget;
+
+impl IPromsieNotToMemForget {
+	/// # Safety
+	/// Types that use this require you don't `mem::forget` them.
+	/// Leaking and dropping are fine, but `mem::forget` would let you reuse buffers the OS has a reference to.
+	/// Normal people don't `mem::forget` anyway, but it's technically legal so here's the one unsafe block you need to write to say you won't do that to me.
+	pub unsafe fn new() -> Self {
+		Self
+	}
+}
+
 #[cfg(test)]
 mod test {
 	use core::cell::RefCell;
 
 	use super::*;
+	use crate::ops::UringOp;
 
 	#[test]
 	fn new_ring() {
@@ -434,21 +448,23 @@ mod test {
 	#[test]
 	fn one_nop() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		block_on(&ring, async {
-			ops::Nop::new(&ring).await;
+			ops::Nop::new(&ring).build(pinky_promise).await;
 		});
 	}
 
 	#[test]
 	fn many_nop() {
 		let ring = RefCell::new(Uring::new().unwrap());
+		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		block_on(&ring, async {
 			let mut arr = vec![];
 
 			for _ in 0..4096 {
-				arr.push(ops::Nop::new(&ring));
+				arr.push(ops::Nop::new(&ring).build(pinky_promise));
 			}
 			for nop in arr {
 				nop.await;
