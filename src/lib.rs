@@ -113,7 +113,7 @@ struct SubmissionData {
 pub struct Uring {
 	fd: OwnedFd,
 	sq: Queue<Sqe>,
-	cq: Queue<io_uring_cqe>,
+	cq: Queue<Cqe>,
 	queue_map_len: u32,
 	queue_base: NonNull<u32>,
 	sq_entries: NonNull<Sqe>,
@@ -194,7 +194,7 @@ impl Uring {
 				),
 			};
 
-			let cq: Queue<io_uring_cqe> = Queue {
+			let cq: Queue<Cqe> = Queue {
 				our_ptr: to_ptr(queues_ptr, params.cq_off.head),
 				their_ptr: to_ptr(queues_ptr, params.cq_off.tail),
 				flags: to_ptr(queues_ptr, params.cq_off.flags),
@@ -275,7 +275,7 @@ impl Uring {
 				.submissions
 				.get_mut(&ticket)
 				.expect("request associated with cqe not found");
-			submission.cqe = Some(Cqe(cqe));
+			submission.cqe = Some(cqe);
 			submission.waker.wake_by_ref();
 		}
 
