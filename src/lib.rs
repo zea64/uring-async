@@ -8,14 +8,13 @@ use core::{
 	ffi::c_void,
 	fmt::{self, Debug},
 	future::Future,
+	marker::PhantomPinned,
 	mem::size_of,
-	num::NonZeroU64,
 	ops::{Deref, DerefMut, Rem},
 	pin::Pin,
 	ptr::{self, NonNull},
 	task::{Context, Poll, Waker},
 };
-use std::collections::HashMap;
 
 use rustix::{
 	fd::OwnedFd,
@@ -104,12 +103,6 @@ impl<T: Default + Debug> Queue<T> {
 }
 
 #[derive(Debug)]
-struct SubmissionData {
-	waker: Waker,
-	cqe: Option<Cqe>,
-}
-
-#[derive(Debug)]
 pub struct Uring {
 	fd: OwnedFd,
 	sq: Queue<Sqe>,
@@ -117,9 +110,7 @@ pub struct Uring {
 	queue_map_len: u32,
 	queue_base: NonNull<u32>,
 	sq_entries: NonNull<Sqe>,
-	submissions: HashMap<u64, SubmissionData>,
 	in_flight: u32,
-	ticket: u64,
 }
 
 impl Uring {
@@ -211,25 +202,12 @@ impl Uring {
 				sq_entries: NonNull::new_unchecked(sq_entries_ptr.cast()),
 				queue_base: NonNull::new_unchecked(queues_ptr.cast()),
 				queue_map_len: queue_map_len as u32,
-				submissions: HashMap::new(),
 				in_flight: 0,
-				ticket: 0,
 			})
 		}
 	}
 
 	pub fn push(&mut self, mut sqe: Sqe) -> Option<()> {
-		assert!(self
-			.submissions
-			.insert(
-				sqe.user_data.u64_(),
-				SubmissionData {
-					waker: Waker::noop().clone(),
-					cqe: None
-				}
-			)
-			.is_none());
-
 		loop {
 			let x = self.sq.push(&mut sqe);
 
@@ -269,14 +247,14 @@ impl Uring {
 		while let Some(cqe) = self.cq.pop() {
 			self.in_flight -= 1;
 
-			let ticket = cqe.user_data.u64_();
-			// Normally this should always be found, if not early return to tell the caller they fucked up.
-			let submission = self
-				.submissions
-				.get_mut(&ticket)
-				.expect("request associated with cqe not found");
-			submission.cqe = Some(cqe);
-			submission.waker.wake_by_ref();
+			let pending_cqe = unsafe { &mut *cqe.user_data.ptr().cast::<PendingCqe>() };
+
+			if let PendingCqe::Pending(waker, _) = pending_cqe {
+				waker.wake_by_ref();
+				*pending_cqe = PendingCqe::Complete(cqe);
+			} else {
+				unreachable!();
+			}
 		}
 
 		Some(submitted)
@@ -292,41 +270,6 @@ impl Uring {
 
 	pub fn in_flight(&self) -> u32 {
 		self.in_flight
-	}
-
-	pub fn map_entries(&self) -> usize {
-		self.submissions.len()
-	}
-
-	pub fn get_ticket(&mut self) -> NonZeroU64 {
-		// At 10 billion additions per second, this would take 58 years to overflow.
-		self.ticket += 1;
-		NonZeroU64::new(self.ticket).unwrap()
-	}
-
-	pub fn poll(&mut self, user_data: u64, context: Option<&Context>) -> Option<Cqe> {
-		let waker = context.map(|x| x.waker()).unwrap_or(Waker::noop());
-
-		match self.submissions.get_mut(&user_data) {
-			None => panic!("request associated with user_data not found"),
-			Some(data) => {
-				// Subsequent poll.
-				if data.cqe.is_some() {
-					// We have data for you!
-					let cqe = data.cqe.take();
-					self.submissions.remove(&user_data);
-
-					cqe
-				} else {
-					// No data yet :(
-					if !data.waker.will_wake(waker) {
-						data.waker.clone_from(waker);
-					}
-
-					None
-				}
-			}
-		}
 	}
 }
 
@@ -348,21 +291,7 @@ impl Drop for Uring {
 
 #[derive(Default)]
 #[repr(transparent)]
-pub struct Sqe(io_uring_sqe);
-
-impl Sqe {
-	/// # Safety
-	/// These will be passed nearly unmodified to the io_uring subsystem.
-	/// These are effectively syscalls, follow the relevant safety info in the docs.
-	pub unsafe fn new(sqe: io_uring_sqe) -> Self {
-		Sqe(sqe)
-	}
-
-	pub fn set_user_data(mut self, user_data: u64) -> Self {
-		self.user_data = io_uring_user_data::from_u64(user_data);
-		self
-	}
-}
+pub struct Sqe(pub io_uring_sqe);
 
 impl Debug for Sqe {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -388,7 +317,7 @@ impl DerefMut for Sqe {
 
 #[repr(transparent)]
 #[derive(Debug, Default)]
-pub struct Cqe(io_uring_cqe);
+pub struct Cqe(pub io_uring_cqe);
 
 impl Deref for Cqe {
 	type Target = io_uring_cqe;
@@ -401,6 +330,24 @@ impl Deref for Cqe {
 impl DerefMut for Cqe {
 	fn deref_mut(&mut self) -> &mut Self::Target {
 		&mut self.0
+	}
+}
+
+impl Clone for Cqe {
+	fn clone(&self) -> Self {
+		Self(unsafe { ptr::read(&self.0) })
+	}
+}
+
+#[derive(Debug)]
+enum PendingCqe {
+	Pending(Waker, PhantomPinned),
+	Complete(Cqe),
+}
+
+impl Default for PendingCqe {
+	fn default() -> Self {
+		Self::Complete(Cqe::default())
 	}
 }
 
@@ -420,25 +367,11 @@ pub fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
 	}
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct IPromsieNotToMemForget;
-
-impl IPromsieNotToMemForget {
-	/// # Safety
-	/// Types that use this require you don't `mem::forget` them.
-	/// Leaking and dropping are fine, but `mem::forget` would let you reuse buffers the OS has a reference to.
-	/// Normal people don't `mem::forget` anyway, but it's technically legal so here's the one unsafe block you need to write to say you won't do that to me.
-	pub unsafe fn new() -> Self {
-		Self
-	}
-}
-
 #[cfg(test)]
 mod test {
-	use core::cell::RefCell;
+	use core::{cell::RefCell, future::join};
 
-	use super::*;
-	use crate::ops::UringOp;
+	use crate::*;
 
 	#[test]
 	fn new_ring() {
@@ -446,29 +379,20 @@ mod test {
 	}
 
 	#[test]
-	fn one_nop() {
+	fn nop() {
 		let ring = RefCell::new(Uring::new().unwrap());
-		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		block_on(&ring, async {
-			ops::Nop::new(&ring).build(pinky_promise).await;
-		});
+			ops::Nop::new(&ring).await;
+		})
 	}
 
 	#[test]
 	fn many_nop() {
 		let ring = RefCell::new(Uring::new().unwrap());
-		let pinky_promise = unsafe { IPromsieNotToMemForget::new() };
 
 		block_on(&ring, async {
-			let mut arr = vec![];
-
-			for _ in 0..4096 {
-				arr.push(ops::Nop::new(&ring).build(pinky_promise));
-			}
-			for nop in arr {
-				nop.await;
-			}
+			join!(ops::Nop::new(&ring), ops::Nop::new(&ring)).await;
 		})
 	}
 }
