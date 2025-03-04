@@ -1,3 +1,4 @@
+style_edition = "2024"
 condense_wildcard_suffixes = true
 format_code_in_doc_comments = true
 hard_tabs = true

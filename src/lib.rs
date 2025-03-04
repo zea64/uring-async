@@ -1,4 +1,4 @@
-#![feature(future_join, noop_waker)]
+#![feature(future_join)]
 
 pub mod ops;
 pub mod sync;
@@ -7,7 +7,6 @@ use core::{
 	cell::RefCell,
 	ffi::c_void,
 	fmt::{self, Debug},
-	future::Future,
 	marker::PhantomPinned,
 	mem::size_of,
 	ops::{Deref, DerefMut, Rem},
@@ -20,7 +19,7 @@ use rustix::{
 	fd::OwnedFd,
 	io::{Errno, Result as PosixResult},
 	io_uring::*,
-	mm::{mmap, munmap, MapFlags, ProtFlags},
+	mm::{MapFlags, ProtFlags, mmap, munmap},
 };
 
 fn posix_result(ret: i32) -> PosixResult<u32> {
@@ -172,7 +171,7 @@ impl Uring {
 
 			#[inline]
 			unsafe fn to_ptr(base: *mut c_void, offset: u32) -> &'static mut u32 {
-				&mut *base.byte_offset(offset as isize).cast()
+				unsafe { &mut *base.byte_offset(offset as isize).cast() }
 			}
 
 			let sq: Queue<Sqe> = Queue {

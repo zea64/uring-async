@@ -1,8 +1,8 @@
 [package]
 name = "uring-async"
 version = "0.0.0"
-edition = "2021"
-rust-version = "1.84"
+edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 rustix = { version = "0.38", features = ["io_uring", "mm"] }

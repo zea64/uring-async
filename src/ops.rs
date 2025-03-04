@@ -1,7 +1,6 @@
 use core::{
 	cell::RefCell,
 	ffi::CStr,
-	future::Future,
 	marker::PhantomPinned,
 	mem,
 	pin::Pin,
@@ -322,7 +321,7 @@ mod test {
 
 	use rustix::{
 		fd::{AsFd, AsRawFd, BorrowedFd},
-		fs::{self, AtFlags, Mode, OFlags, CWD},
+		fs::{self, AtFlags, CWD, Mode, OFlags},
 		io,
 	};
 
