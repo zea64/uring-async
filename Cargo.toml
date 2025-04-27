@@ -5,7 +5,4 @@ edition = "2024"
 rust-version = "1.85"
 
 [dependencies]
-rustix = { version = "0.38", features = ["io_uring", "mm"] }
-
-[dev-dependencies]
-rustix = { version = "0.38", features = ["pipe"] }
+rustix = { version = "1.0.0", features = ["io_uring", "mm"] }
