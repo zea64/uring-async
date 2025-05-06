@@ -1,19 +1,22 @@
+#![allow(clippy::tabs_in_doc_comments)]
+
 use core::{
-	error::Error,
+	cmp::min,
 	ffi::c_void,
-	fmt,
 	mem::{self, MaybeUninit},
 	ptr::{self, NonNull},
 	slice,
+	time::Duration,
 };
-use std::os::fd::AsFd;
 
 use rustix::{
-	fd::OwnedFd,
+	fd::{AsFd, OwnedFd},
 	io::Errno,
 	io_uring::*,
 	mm::{MapFlags, ProtFlags, mmap, munmap},
 };
+
+pub mod ops;
 
 #[derive(Debug)]
 struct Mmapped(NonNull<c_void>, usize);
@@ -81,17 +84,6 @@ impl<T> RingBuffer<'_, T> {
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct QueueFullError;
-
-impl Error for QueueFullError {}
-
-impl fmt::Display for QueueFullError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str("io_uring submission queue full")
-	}
-}
-
 #[derive(Debug)]
 pub struct Uring {
 	cq_mmap: Mmapped,
@@ -104,6 +96,7 @@ pub struct Uring {
 	sq_head_off: u32,
 	sq_tail_off: u32,
 	sq_size: u32,
+	in_flight: u32,
 }
 
 impl Uring {
@@ -199,26 +192,119 @@ impl Uring {
 			sq_head_off: params.sq_off.head,
 			sq_tail_off: params.sq_off.tail,
 			sq_size: params.sq_entries,
+			in_flight: 0,
 		})
 	}
 
 	/// # Safety
 	/// `sqe` sends low level commands to the kernel that, for instance, can read and write to arbitrary memory. Consult the safety conditions of the underlying io_uring operations and corresponding syscalls.
-	pub unsafe fn push(&mut self, sqe: io_uring_sqe) -> Result<(), QueueFullError> {
-		self.sq().push(sqe).map_err(|_| QueueFullError)
+	pub unsafe fn push(&mut self, sqe: Sqe) -> Result<(), Errno> {
+		let sqe = sqe.into();
+
+		while self.sq().push(sqe).is_err() {
+			self.enter(0, None, None)?;
+		}
+
+		Ok(())
 	}
 
-	pub fn pop(&mut self) -> Option<io_uring_cqe> {
-		self.cq().pop()
+	pub fn enter(
+		&mut self,
+		min_complete: u32,
+		min_wait: Option<Duration>,
+		timeout: Option<Duration>,
+	) -> Result<u32, Errno> {
+		let min_wait = min_wait
+			.map(|mw| match mw.as_micros() {
+				t if t > u32::MAX as u128 => u32::MAX,
+				t => t as u32,
+			})
+			.unwrap_or_default();
+
+		let timeout = timeout.map(|t| Timespec {
+			tv_sec: t.as_secs() as i64,
+			tv_nsec: (t.as_nanos() % 1_000_000_000) as i64,
+		});
+
+		let args = io_uring_getevents_arg {
+			sigmask: io_uring_ptr::null(),
+			sigmask_sz: 0,
+			min_wait_usec: min_wait,
+			ts: io_uring_ptr::new(
+				timeout
+					.map(|mut t| &raw mut t)
+					.unwrap_or(ptr::null_mut())
+					.cast(),
+			),
+		};
+
+		let to_sumbit = self.sq().len();
+		self.in_flight += to_sumbit;
+
+		let submitted = unsafe {
+			io_uring_enter_arg(
+				self.fd.as_fd(),
+				to_sumbit,
+				min(min_complete, self.in_flight),
+				IoringEnterFlags::GETEVENTS | IoringEnterFlags::EXT_ARG,
+				Some(&args),
+			)
+		}?;
+
+		while let Some(cqe) = self.cq().pop() {
+			let ptr: *mut () = cqe.user_data.ptr().cast();
+
+			if let Some(callback) = unsafe { &*ptr.cast::<CompletionCallback>() } {
+				self.in_flight -= unsafe { (callback)(ptr, cqe) } as u32;
+			} else {
+				self.in_flight -= 1;
+			}
+		}
+
+		Ok(submitted)
+	}
+}
+
+pub type CompletionCallback = Option<unsafe fn(*mut (), io_uring_cqe) -> bool>;
+
+pub struct Sqe(io_uring_sqe);
+
+impl Sqe {
+	/// # Safety
+	/// `callback` must point to a valid function pointer of type `CompletionCallback`.
+	/// Usually, you will use it like this:
+	/// ```rs
+	/// #[repr(C)]
+	/// struct Foo {
+	/// 	callback: CompletionCallback,
+	/// 	other_stuff: blah,
+	/// }
+	/// ```
+	/// and cast a pointer to `Foo` into a pointer to `CompletionCallback`.
+	pub unsafe fn new(mut sqe: io_uring_sqe, callback: NonNull<CompletionCallback>) -> Self {
+		sqe.user_data.ptr.ptr = callback.as_ptr().cast();
+		Self(sqe)
+	}
+}
+
+impl From<Sqe> for io_uring_sqe {
+	fn from(value: Sqe) -> Self {
+		value.0
 	}
 }
 
 #[cfg(test)]
 mod test {
-	use crate::*;
+	use core::{
+		future::Future,
+		pin::Pin,
+		task::{Context, Poll, Waker},
+	};
+
+	use crate::{ops::*, *};
 
 	#[test]
-	fn basic() {
+	fn low_level_ring_works() {
 		let mut ring = Uring::new(64).unwrap();
 		let mut sq = ring.sq();
 
@@ -243,5 +329,24 @@ mod test {
 			assert_eq!(cqe.user_data.u64_(), i);
 		}
 		assert!(cq.pop().is_none());
+	}
+
+	#[test]
+	fn op_works() {
+		let mut ring = Uring::new(64).unwrap();
+
+		let mut sqe: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
+		sqe.opcode = IoringOp::Nop;
+
+		let mut op = Op::new();
+		Op::init(unsafe { Pin::new_unchecked(&mut op) }, &mut ring, sqe);
+
+		ring.enter(1, None, None).unwrap();
+
+		let res = Future::poll(
+			unsafe { Pin::new_unchecked(&mut op) },
+			&mut Context::from_waker(Waker::noop()),
+		);
+		assert_eq!(res, Poll::Ready((0, IoringCqeFlags::empty())));
 	}
 }
