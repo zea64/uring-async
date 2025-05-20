@@ -1,14 +1,17 @@
 use core::{
+	cell::RefCell,
 	marker::PhantomPinned,
-	mem,
+	mem::{self, MaybeUninit},
 	pin::Pin,
 	ptr::NonNull,
 	task::{Context, Poll, Waker},
 };
 
-use rustix::io_uring::{IoringCqeFlags, io_uring_cqe, io_uring_sqe};
+use rustix::io_uring::*;
 
 use crate::{CompletionCallback, Sqe, Uring};
+
+const ZERO_SQE: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
 
 #[derive(Debug)]
 enum OpInner {
@@ -22,7 +25,7 @@ impl Default for OpInner {
 	}
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[must_use]
 #[repr(C)]
 pub struct Op {
@@ -48,19 +51,28 @@ impl Op {
 	}
 
 	pub fn new() -> Self {
-		Self::default()
+		Self {
+			callback: Some(Self::op_completion_callback),
+			inner: OpInner::Pending(Waker::noop().clone()),
+			_marker: PhantomPinned,
+		}
 	}
 
 	pub fn init(self: Pin<&mut Self>, ring: &mut Uring, sqe: io_uring_sqe) {
 		unsafe {
 			let this = Pin::into_inner_unchecked(self);
-			this.callback = Some(Self::op_completion_callback);
 			ring.push(Sqe::new(
 				sqe,
 				NonNull::new_unchecked(&raw mut this.callback),
 			))
 			.unwrap();
 		}
+	}
+}
+
+impl Default for Op {
+	fn default() -> Self {
+		Self::new()
 	}
 }
 
@@ -80,5 +92,53 @@ impl Future for Op {
 				Poll::Ready((res, flags))
 			}
 		}
+	}
+}
+
+pub async fn nop(ring: &RefCell<Uring>) {
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Nop;
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	unsafe { Pin::new_unchecked(&mut op) }.await;
+}
+
+#[cfg(test)]
+mod test {
+	use core::{
+		cell::RefCell,
+		pin::Pin,
+		task::{Context, Poll, Waker},
+	};
+
+	use crate::*;
+
+	fn block_on<F: Future>(ring: &RefCell<Uring>, mut fut: F) -> F::Output {
+		loop {
+			if let Poll::Ready(x) = Future::poll(
+				unsafe { Pin::new_unchecked(&mut fut) },
+				&mut Context::from_waker(Waker::noop()),
+			) {
+				return x;
+			}
+
+			ring.borrow_mut().enter(1, None, None).unwrap();
+		}
+	}
+
+	#[test]
+	fn nop() {
+		let ring = RefCell::new(Uring::new(1, 0).unwrap());
+
+		let f = ops::nop(&ring);
+		eprintln!("{}", core::mem::size_of_val(&f));
+
+		block_on(&ring, f);
 	}
 }
