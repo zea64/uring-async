@@ -1,6 +1,7 @@
 #![allow(clippy::tabs_in_doc_comments)]
 
 use core::{
+	cell::RefCell,
 	cmp::min,
 	ffi::c_void,
 	mem::{self, MaybeUninit},
@@ -9,6 +10,7 @@ use core::{
 	time::Duration,
 };
 
+use fd::*;
 use rustix::{
 	fd::{AsFd, OwnedFd},
 	io::Errno,
@@ -16,6 +18,7 @@ use rustix::{
 	mm::{MapFlags, ProtFlags, mmap, munmap},
 };
 
+pub mod fd;
 pub mod ops;
 
 #[derive(Debug)]
@@ -97,6 +100,7 @@ pub struct Uring {
 	sq_tail_off: u32,
 	sq_size: u32,
 	in_flight: u32,
+	fixed_files: FixedFileSet,
 }
 
 impl Uring {
@@ -128,7 +132,7 @@ impl Uring {
 		}
 	}
 
-	pub fn new(entries: u32) -> Result<Self, Errno> {
+	pub fn new(entries: u32, fixed_files: u32) -> Result<Self, Errno> {
 		let mut params = io_uring_params::default();
 		params.flags = IoringSetupFlags::CLAMP
 			| IoringSetupFlags::SUBMIT_ALL
@@ -181,6 +185,8 @@ impl Uring {
 		assert!(params.cq_entries.is_power_of_two());
 		assert!(params.sq_entries.is_power_of_two());
 
+		let fixed_files = unsafe { FixedFileSet::new(fd.as_fd(), fixed_files) }?;
+
 		Ok(Uring {
 			fd,
 			cq_mmap,
@@ -193,6 +199,7 @@ impl Uring {
 			sq_tail_off: params.sq_off.tail,
 			sq_size: params.sq_entries,
 			in_flight: 0,
+			fixed_files,
 		})
 	}
 
@@ -263,6 +270,19 @@ impl Uring {
 
 		Ok(submitted)
 	}
+
+	pub fn get_fixed_file<'a>(this: &'a RefCell<Self>) -> Option<FixedFd<'a>> {
+		Some(FixedFd {
+			ring: this,
+			fd: this.borrow_mut().fixed_files.alloc()?.try_into().unwrap(),
+		})
+	}
+
+	/// # Safety
+	/// Callers must pass only values obtained from [`Uring::get_fixed_file`] and do so at most once. Same rules as memory deallocation.
+	unsafe fn return_fixed_file(&mut self, file: u32) {
+		self.fixed_files.dealloc(file)
+	}
 }
 
 pub type CompletionCallback = Option<unsafe fn(*mut (), io_uring_cqe) -> bool>;
@@ -305,7 +325,7 @@ mod test {
 
 	#[test]
 	fn low_level_ring_works() {
-		let mut ring = Uring::new(64).unwrap();
+		let mut ring = Uring::new(64, 0).unwrap();
 		let mut sq = ring.sq();
 
 		for i in 0.. {
@@ -333,7 +353,7 @@ mod test {
 
 	#[test]
 	fn op_works() {
-		let mut ring = Uring::new(64).unwrap();
+		let mut ring = Uring::new(64, 0).unwrap();
 
 		let mut sqe: io_uring_sqe = unsafe { MaybeUninit::zeroed().assume_init() };
 		sqe.opcode = IoringOp::Nop;
