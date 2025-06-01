@@ -257,6 +257,38 @@ pub async fn close_direct(ring: &RefCell<Uring>, fd: &FixedFd<'_>) -> Result<(),
 	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| ())
 }
 
+pub async fn openat(
+	ring: &RefCell<Uring>,
+	dirfd: impl UringFd,
+	path: &CStr,
+	flags: OFlags,
+	mode: Mode,
+) -> Result<OwnedFd, Errno> {
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Openat;
+	sqe.fd = dirfd.fd();
+	if dirfd.is_fixed() {
+		sqe.flags = IoringSqeFlags::FIXED_FILE;
+	}
+	sqe.addr_or_splice_off_in = addr_or_splice_off_in_union {
+		addr: io_uring_ptr::new(path.as_ptr().cast_mut().cast()),
+	};
+	sqe.len = len_union {
+		len: mode.as_raw_mode(),
+	};
+	sqe.op_flags = op_flags_union { open_flags: flags };
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0)
+		.map(|raw_fd| unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
 pub async fn openat_direct(
 	ring: &RefCell<Uring>,
 	dirfd: impl UringFd,
@@ -405,6 +437,21 @@ mod test {
 
 			assert_eq!(ops::close_direct(&ring, &file).await, Err(Errno::BADF));
 		});
+	}
+
+	#[test]
+	fn openat() {
+		let ring = RefCell::new(Uring::new(1, 1).unwrap());
+
+		let fd = block_on(&ring, async {
+			ops::openat(&ring, CWD, c"/dev/zero", OFlags::RDONLY, Mode::empty())
+				.await
+				.unwrap()
+		});
+
+		let mut buf = [1u8; 64];
+		io::read(fd, &mut buf).unwrap();
+		assert_eq!(buf, [0u8; 64]);
 	}
 
 	#[test]
