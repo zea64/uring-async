@@ -393,6 +393,40 @@ pub async fn openat2_direct(
 	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| ())
 }
 
+pub async fn statx(
+	ring: &RefCell<Uring>,
+	dirfd: impl UringFd,
+	path: &CStr,
+	flags: AtFlags,
+	mask: StatxFlags,
+) -> Result<Statx, Errno> {
+	let mut buf: Statx = unsafe { MaybeUninit::zeroed().assume_init() };
+
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Statx;
+	sqe.fd = dirfd.fd();
+	if dirfd.is_fixed() {
+		sqe.flags = IoringSqeFlags::FIXED_FILE;
+	}
+	sqe.addr_or_splice_off_in = addr_or_splice_off_in_union {
+		addr: io_uring_ptr::from(path.as_ptr().cast_mut().cast()),
+	};
+	sqe.off_or_addr2 = off_or_addr2_union {
+		addr2: io_uring_ptr::from((&raw mut buf).cast()),
+	};
+	sqe.len = len_union { len: mask.bits() };
+	sqe.op_flags = op_flags_union { statx_flags: flags };
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| buf)
+}
+
 #[cfg(test)]
 mod test {
 	use core::{
@@ -587,5 +621,25 @@ mod test {
 		let mut buf = [1u8; 64];
 		io::read(regular_fd, &mut buf).unwrap();
 		assert_eq!(buf, [0u8; 64]);
+	}
+
+	#[test]
+	fn statx() {
+		let ring = RefCell::new(Uring::new(1, 0).unwrap());
+
+		let statx = block_on(
+			&ring,
+			ops::statx(
+				&ring,
+				CWD,
+				c"/dev/null",
+				AtFlags::empty(),
+				StatxFlags::BASIC_STATS,
+			),
+		)
+		.unwrap();
+
+		assert_eq!(statx.stx_rdev_major, 1);
+		assert_eq!(statx.stx_rdev_minor, 3);
 	}
 }
