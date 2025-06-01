@@ -324,6 +324,75 @@ pub async fn openat_direct(
 	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| ())
 }
 
+pub async fn openat2(
+	ring: &RefCell<Uring>,
+	dirfd: impl UringFd,
+	path: &CStr,
+	how: &open_how,
+) -> Result<OwnedFd, Errno> {
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Openat2;
+	sqe.fd = dirfd.fd();
+	if dirfd.is_fixed() {
+		sqe.flags = IoringSqeFlags::FIXED_FILE;
+	}
+	sqe.addr_or_splice_off_in = addr_or_splice_off_in_union {
+		addr: io_uring_ptr::from(path.as_ptr().cast_mut().cast()),
+	};
+	sqe.off_or_addr2 = off_or_addr2_union {
+		addr2: io_uring_ptr::from((&raw const *how).cast_mut().cast()),
+	};
+	sqe.len = len_union {
+		len: size_of::<open_how>().try_into().unwrap(),
+	};
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0)
+		.map(|raw_fd| unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+pub async fn openat2_direct(
+	ring: &RefCell<Uring>,
+	dirfd: impl UringFd,
+	path: &CStr,
+	how: &open_how,
+	out_file: &FixedFd<'_>,
+) -> Result<(), Errno> {
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Openat2;
+	sqe.fd = dirfd.fd();
+	if dirfd.is_fixed() {
+		sqe.flags = IoringSqeFlags::FIXED_FILE;
+	}
+	sqe.addr_or_splice_off_in = addr_or_splice_off_in_union {
+		addr: io_uring_ptr::from(path.as_ptr().cast_mut().cast()),
+	};
+	sqe.off_or_addr2 = off_or_addr2_union {
+		addr2: io_uring_ptr::from((&raw const *how).cast_mut().cast()),
+	};
+	sqe.len = len_union {
+		len: size_of::<open_how>().try_into().unwrap(),
+	};
+	sqe.splice_fd_in_or_file_index_or_addr_len = splice_fd_in_or_file_index_or_addr_len_union {
+		file_index: out_file.fd as u32 + 1,
+	};
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| ())
+}
+
 #[cfg(test)]
 mod test {
 	use core::{
@@ -470,6 +539,47 @@ mod test {
 			)
 			.await
 			.unwrap();
+
+			ops::fixed_fd_install(&ring, &file).await.unwrap()
+		});
+
+		let mut buf = [1u8; 64];
+		io::read(regular_fd, &mut buf).unwrap();
+		assert_eq!(buf, [0u8; 64]);
+	}
+
+	#[test]
+	fn openat2() {
+		let ring = RefCell::new(Uring::new(1, 0).unwrap());
+
+		let mut how = open_how::default();
+		how.flags = OFlags::RDONLY.bits().into();
+		how.mode = 0;
+		how.resolve = ResolveFlags::empty();
+
+		let fd = block_on(&ring, async {
+			ops::openat2(&ring, CWD, c"/dev/zero", &how).await.unwrap()
+		});
+
+		let mut buf = [1u8; 64];
+		io::read(fd, &mut buf).unwrap();
+		assert_eq!(buf, [0u8; 64]);
+	}
+
+	#[test]
+	fn openat2_direct() {
+		let ring = RefCell::new(Uring::new(1, 1).unwrap());
+
+		let file = Uring::get_fixed_file(&ring).unwrap();
+		let mut how = open_how::default();
+		how.flags = OFlags::RDONLY.bits().into();
+		how.mode = 0;
+		how.resolve = ResolveFlags::empty();
+
+		let regular_fd = block_on(&ring, async {
+			ops::openat2_direct(&ring, CWD, c"/dev/zero", &how, &file)
+				.await
+				.unwrap();
 
 			ops::fixed_fd_install(&ring, &file).await.unwrap()
 		});
