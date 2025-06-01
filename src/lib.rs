@@ -1,3 +1,4 @@
+#![feature(future_join)]
 #![allow(clippy::tabs_in_doc_comments)]
 
 use core::{
@@ -66,6 +67,14 @@ impl<T> RingBuffer<'_, T> {
 		let value = unsafe { self.index_mut(*self.head).assume_init_read() };
 		*self.head += 1;
 		Some(value)
+	}
+
+	fn get_last(&mut self) -> Option<&mut T> {
+		if self.len() == 0 {
+			return None;
+		}
+
+		Some(unsafe { self.index_mut(*self.head).assume_init_mut() })
 	}
 
 	#[inline]

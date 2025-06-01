@@ -121,6 +121,90 @@ pub async fn nop(ring: &RefCell<Uring>) {
 	unsafe { Pin::new_unchecked(&mut op) }.await;
 }
 
+#[derive(Debug)]
+#[repr(C)]
+struct CompletionNotifier {
+	callback: CompletionCallback,
+	orig_callback: *mut CompletionCallback,
+	waker: Option<Waker>,
+}
+
+impl CompletionNotifier {
+	unsafe fn callback(this: *mut (), cqe: io_uring_cqe) -> bool {
+		let this: &mut CompletionNotifier = unsafe { &mut *this.cast() };
+		this.waker.take().unwrap().wake();
+
+		if let Some(f) = &unsafe { *this.orig_callback } {
+			unsafe { f(this.orig_callback.cast(), cqe) }
+		} else {
+			true
+		}
+	}
+
+	fn new(orig_callback: *mut CompletionCallback) -> Self {
+		Self {
+			callback: Some(Self::callback),
+			orig_callback,
+			waker: Some(Waker::noop().clone()),
+		}
+	}
+}
+
+impl Future for CompletionNotifier {
+	type Output = ();
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = unsafe { Pin::into_inner_unchecked(self) };
+
+		match this.waker {
+			None => Poll::Ready(()),
+			Some(ref mut waker) => {
+				*waker = cx.waker().clone();
+				Poll::Pending
+			}
+		}
+	}
+}
+
+pub async fn link<'a, F: Future>(
+	ring: &'a RefCell<Uring>,
+	mut fut: Pin<&'a mut F>,
+) -> Pin<&'a mut F> {
+	// Make sure it ends up in the ring.
+	// For our io_uring futures, we can guarantee it will not complete on first poll.
+	match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+		Poll::Pending => (),
+		Poll::Ready(_) => unimplemented!(),
+	}
+
+	let mut borrowed_ring = ring.borrow_mut();
+	let mut sq = borrowed_ring.sq();
+
+	let len = sq.len();
+	let capacity = sq.capacity();
+
+	let sqe = match sq.get_last() {
+		Some(s) => s,
+		None => return fut,
+	};
+
+	sqe.flags |= IoringSqeFlags::IO_LINK;
+
+	if len != capacity {
+		return fut;
+	}
+
+	let orig_obj: &mut CompletionCallback = unsafe { &mut *sqe.user_data.ptr.ptr.cast() };
+	let mut notifier = CompletionNotifier::new(orig_obj);
+
+	sqe.user_data = io_uring_user_data::from_ptr((&raw mut notifier).cast());
+
+	drop(borrowed_ring);
+
+	unsafe { Pin::new_unchecked(&mut notifier) }.await;
+	fut
+}
+
 pub async fn fixed_fd_install(
 	ring: &RefCell<Uring>,
 	fixed_fd: &FixedFd<'_>,
@@ -180,9 +264,11 @@ pub async fn openat_direct(
 mod test {
 	use core::{
 		cell::RefCell,
-		pin::Pin,
+		future::join,
+		pin::{Pin, pin},
 		task::{Context, Poll, Waker},
 	};
+	use std::os::fd::{AsRawFd, FromRawFd};
 
 	use rustix::{fs::CWD, io};
 
@@ -209,6 +295,45 @@ mod test {
 		eprintln!("{}", core::mem::size_of_val(&f));
 
 		block_on(&ring, f);
+	}
+
+	#[test]
+	fn link() {
+		let ring = RefCell::new(Uring::new(2, 0).unwrap());
+
+		async fn order<F: Future>(f: F, output: &RefCell<Vec<u8>>, val: u8) {
+			let _ = f.await;
+			output.borrow_mut().push(val);
+		}
+
+		block_on(&ring, async {
+			let output = RefCell::new(Vec::new());
+
+			{
+				let tmp1 = pin!(order(ops::nop(&ring), &output, 0));
+				let n1 = ops::link(&ring, tmp1).await;
+				let n2 = order(ops::nop(&ring), &output, 1);
+
+				join!(n1, n2).await;
+			}
+			assert_eq!(output.into_inner(), &[0, 1]);
+		});
+
+		block_on(&ring, async {
+			let output = RefCell::new(Vec::new());
+
+			{
+				let mut n1 = pin!(order(ops::nop(&ring), &output, 0));
+				ops::link(&ring, n1.as_mut()).await;
+				let mut n2 = pin!(order(ops::nop(&ring), &output, 1));
+				ops::link(&ring, n2.as_mut()).await;
+				let n3 = order(ops::nop(&ring), &output, 2);
+
+				// n1 and n2 have to be processed in this order because they complete at the same time
+				join!(n3, n1, n2).await;
+			}
+			assert_eq!(output.into_inner(), &[0, 1, 2]);
+		});
 	}
 
 	#[test]
