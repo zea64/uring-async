@@ -9,7 +9,7 @@ use core::{
 };
 
 use rustix::{
-	fd::{FromRawFd, OwnedFd},
+	fd::{FromRawFd, IntoRawFd, OwnedFd},
 	io_uring::*,
 };
 
@@ -225,6 +225,38 @@ pub async fn fixed_fd_install(
 		.map(|raw_fd| unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
+pub async fn close(ring: &RefCell<Uring>, fd: OwnedFd) -> Result<(), Errno> {
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Close;
+	sqe.fd = fd.into_raw_fd();
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| ())
+}
+
+pub async fn close_direct(ring: &RefCell<Uring>, fd: &FixedFd<'_>) -> Result<(), Errno> {
+	let mut sqe = ZERO_SQE;
+	sqe.opcode = IoringOp::Close;
+	sqe.splice_fd_in_or_file_index_or_addr_len = splice_fd_in_or_file_index_or_addr_len_union {
+		file_index: fd.fd as u32 + 1,
+	};
+
+	let mut op = Op::new();
+	Op::init(
+		unsafe { Pin::new_unchecked(&mut op) },
+		&mut ring.borrow_mut(),
+		sqe,
+	);
+
+	error_code(unsafe { Pin::new_unchecked(&mut op) }.await.0).map(|_| ())
+}
+
 pub async fn openat_direct(
 	ring: &RefCell<Uring>,
 	dirfd: impl UringFd,
@@ -333,6 +365,45 @@ mod test {
 				join!(n3, n1, n2).await;
 			}
 			assert_eq!(output.into_inner(), &[0, 1, 2]);
+		});
+	}
+
+	#[test]
+	fn close() {
+		let ring = RefCell::new(Uring::new(1, 0).unwrap());
+
+		let fd = rustix::fs::open("/dev/null", OFlags::RDONLY, Mode::empty()).unwrap();
+		let copied_fd = unsafe { OwnedFd::from_raw_fd(fd.as_raw_fd()) };
+
+		block_on(&ring, ops::close(&ring, fd)).unwrap();
+
+		let mut buf = [0];
+		assert_eq!(
+			rustix::io::read(copied_fd.as_fd(), &mut buf),
+			Err(Errno::BADF)
+		);
+		mem::forget(copied_fd);
+	}
+
+	#[test]
+	fn close_direct() {
+		let ring = RefCell::new(Uring::new(1, 1).unwrap());
+
+		block_on(&ring, async {
+			let file = Uring::get_fixed_file(&ring).unwrap();
+			ops::openat_direct(
+				&ring,
+				CWD,
+				c"/dev/null",
+				OFlags::RDONLY,
+				Mode::empty(),
+				&file,
+			)
+			.await
+			.unwrap();
+			ops::close_direct(&ring, &file).await.unwrap();
+
+			assert_eq!(ops::close_direct(&ring, &file).await, Err(Errno::BADF));
 		});
 	}
 
